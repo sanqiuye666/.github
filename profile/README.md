@@ -6,7 +6,7 @@
 
   <br><br>
 
-  安域服务器的 Minecraft 公会。<br>
+  一个不隶属于任何服务器的 Minecraft 公会。<br>
   自己写站点，自己做启动器。
 
   <br>
