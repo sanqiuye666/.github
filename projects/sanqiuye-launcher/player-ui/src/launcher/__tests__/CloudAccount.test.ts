@@ -1,0 +1,11 @@
+import {afterEach,expect,it,vi} from 'vitest';import {createApp,nextTick} from 'vue';import CloudAccount from '../server/CloudAccount.vue';
+let app:ReturnType<typeof createApp>|undefined,root:HTMLDivElement;afterEach(()=>{app?.unmount();root?.remove();vi.restoreAllMocks();});
+const envelope=(data:any,error:any=null)=>({schemaVersion:1,requestId:'local-check',source:'LIVE',durationMs:1,attempts:1,data,error});
+async function settle(){for(let i=0;i<15;i++){await Promise.resolve();await nextTick();}}
+it('首页注册走账号服务，显示公开资料并清空口令，不写浏览器存储',async()=>{
+ const stored=vi.spyOn(Storage.prototype,'setItem'),calls:any[]=[];const client={serverCall:async(path:string,body:any)=>{calls.push({path,body});if(path==='/status')return envelope({enabled:true,source:'LIVE',role:'player',message:'真实服务'});if(path==='/account')return envelope(null,{code:'AUTH_FAILED',message:'请登录'});return envelope({id:'1',username:'autumn',displayName:'秋叶',groupId:'default',createdAt:'2026-10-28T00:00:00Z',lastSeenAt:'2026-10-28T00:00:00Z'});}};
+ root=document.createElement('div');document.body.append(root);app=createApp(CloudAccount,{client});app.mount(root);await settle();
+ for(const [key,value]of [['username','autumn'],['display','秋叶'],['password','integration test password']]){const input=root.querySelector<HTMLInputElement>(`[data-cloud-${key}]`)!;input.value=value;input.dispatchEvent(new Event('input'));}await settle();root.querySelector<HTMLButtonElement>('[data-cloud-register]')!.click();await settle();
+ expect(calls.find(c=>c.path==='/account/register')?.body).toMatchObject({username:'autumn',displayName:'秋叶',password:'integration test password'});expect(root.textContent).toContain('秋叶');expect(root.querySelector('input[type=password]')).toBeNull();expect(stored).not.toHaveBeenCalled();
+});
+it('未配置真实服务时显示原因，不允许假注册',async()=>{const client={serverCall:vi.fn(async()=>envelope({enabled:false,source:'DISABLED',role:'player',message:'服务器尚未配置'}))};root=document.createElement('div');document.body.append(root);app=createApp(CloudAccount,{client});app.mount(root);await settle();expect(root.textContent).toContain('尚未配置');expect(root.querySelector('[data-cloud-register]')).toBeNull();expect(client.serverCall).toHaveBeenCalledOnce();});

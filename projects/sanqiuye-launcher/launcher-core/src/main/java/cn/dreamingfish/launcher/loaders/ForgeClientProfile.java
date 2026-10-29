@@ -1,0 +1,25 @@
+package cn.dreamingfish.launcher.loaders;
+import cn.dreamingfish.launcher.GameInstance.LoaderKind;
+import cn.dreamingfish.launcher.storage.LauncherJson;
+import cn.dreamingfish.launcher.downloads.TaskFailure;
+import com.fasterxml.jackson.databind.JsonNode;
+import java.io.*;
+import java.util.*;
+
+/** 只接收已识别的客户端启动参数，不让来源描述改变身份、游戏目录或执行代理。 */
+public record ForgeClientProfile(String mainClass,List<String> jvm,List<String> game,List<MavenLibrary> libraries){
+ public static String id(LoaderIdentity identity,String game){return identity.kind()==LoaderKind.FORGE?game+"-forge-"+identity.version():"neoforge-"+identity.version();}
+ public static ForgeClientProfile parse(byte[] bytes,LoaderIdentity identity,String game)throws IOException{
+  try{var n=LauncherJson.read(bytes,2*1024*1024);String main=identity.kind()==LoaderKind.FORGE?"net.minecraftforge.bootstrap.ForgeBootstrap":"cpw.mods.bootstraplauncher.BootstrapLauncher";if(!id(identity,game).equals(LauncherJson.text(n,"id",256))||!game.equals(LauncherJson.text(n,"inheritsFrom",128))||!main.equals(LauncherJson.text(n,"mainClass",256)))throw new IllegalArgumentException("核心启动身份不匹配");var args=n.path("arguments");var jvm=strings(args.path("jvm"),128);var gameArgs=strings(args.path("game"),64);validateJvm(jvm);validateGame(gameArgs,identity,game);return new ForgeClientProfile(main,jvm,gameArgs,libraries(n.path("libraries"),identity.kind()));}
+  catch(IllegalArgumentException invalid){throw new TaskFailure("UNSUPPORTED_LOADER_FORMAT",invalid.getMessage());}
+ }
+ static List<String> strings(JsonNode n,int max){if(!n.isArray()||n.size()>max)throw new IllegalArgumentException("不支持此核心参数格式");var r=new ArrayList<String>();for(var item:n){if(!item.isTextual()||item.textValue().isBlank()||item.textValue().length()>32768||item.textValue().chars().anyMatch(Character::isISOControl))throw new IllegalArgumentException("核心参数无效");r.add(item.textValue());}return List.copyOf(r);}
+ static List<MavenLibrary> libraries(JsonNode n,LoaderKind kind){if(!n.isArray()||n.size()>256)throw new IllegalArgumentException("核心依赖列表无效");var result=new LinkedHashMap<String,MavenLibrary>();for(var entry:n){if(entry.has("rules")||entry.has("natives"))throw new IllegalArgumentException("尚未支持此核心依赖条件");var lib=MavenLibrary.described(entry,kind);var old=result.putIfAbsent(lib.path(),lib);if(old!=null&&(!old.digest().equals(lib.digest())||!old.size().equals(lib.size())))throw new IllegalArgumentException("核心依赖路径冲突");}return List.copyOf(result.values());}
+ private static void validateGame(List<String> args,LoaderIdentity identity,String game){if(args.size()%2!=0)throw new IllegalArgumentException("核心游戏参数不成对");var values=new HashMap<String,String>();for(int i=0;i<args.size();i+=2){String key=args.get(i),value=args.get(i+1);if(!Set.of("--launchTarget","--fml.neoForgeVersion","--fml.forgeVersion","--fml.fmlVersion","--fml.mcVersion","--fml.neoFormVersion","--fml.mcpVersion","--fml.forgeGroup").contains(key)||values.putIfAbsent(key,value)!=null||!value.matches("[A-Za-z0-9_.+\\-]{1,128}"))throw new IllegalArgumentException("未识别的核心游戏参数");}if(!(identity.kind()==LoaderKind.FORGE?"forge_client":"forgeclient").equals(values.get("--launchTarget")))throw new IllegalArgumentException("核心启动目标不匹配");for(var item:values.entrySet()){if(item.getKey().equals("--fml.mcVersion")&&!game.equals(item.getValue())||Set.of("--fml.neoForgeVersion","--fml.forgeVersion").contains(item.getKey())&&!identity.version().equals(item.getValue()))throw new IllegalArgumentException("核心游戏版本参数不匹配");}}
+ private static void validateJvm(List<String> args){for(int i=0;i<args.size();i++){String value=args.get(i);if(value.equals("-Djava.net.preferIPv6Addresses=system")||value.equals("-Dfml.pluginLayerLibraries=")||value.equals("-Dfml.gameLayerLibraries=")||value.equals("-DlibraryDirectory=${library_directory}"))continue;
+   if(value.startsWith("-DignoreList=")||value.startsWith("-DmergeModules=")){if(!value.substring(value.indexOf('=')+1).replace("${version_name}","client").matches("[A-Za-z0-9_.,+\\-]{1,4096}"))throw new IllegalArgumentException("核心排除列表无效");continue;}
+   if(value.equals("-p")||value.equals("--module-path")){if(++i>=args.size())throw new IllegalArgumentException("缺少核心模块路径");for(String path:args.get(i).split("\\$\\{classpath_separator}",-1)){if(!path.startsWith("${library_directory}/"))throw new IllegalArgumentException("核心模块路径越界");cn.dreamingfish.launcher.vanilla.SafeInstallPath.parse("libraries/"+path.substring(21));}continue;}
+   if(Set.of("--add-modules","--add-opens","--add-exports").contains(value)){if(++i>=args.size())throw new IllegalArgumentException("缺少模块参数");String target=args.get(i);boolean allowed=switch(value){case "--add-modules"->target.equals("ALL-MODULE-PATH");case "--add-opens"->Set.of("java.base/java.util.jar=cpw.mods.securejarhandler","java.base/java.lang.invoke=cpw.mods.securejarhandler").contains(target);default->Set.of("java.base/sun.security.util=cpw.mods.securejarhandler","jdk.naming.dns/com.sun.jndi.dns=java.naming").contains(target);};if(!allowed)throw new IllegalArgumentException("未识别的核心模块访问参数");continue;}
+   throw new IllegalArgumentException("未识别的核心JVM参数："+value);
+  }}
+}

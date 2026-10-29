@@ -1,0 +1,405 @@
+package cn.dreamingfish.updater.management;
+
+import cn.dreamingfish.updater.protocol.CryptoSupport;
+import cn.dreamingfish.updater.protocol.Branding;
+import cn.dreamingfish.updater.protocol.FilePolicy;
+import cn.dreamingfish.updater.protocol.ReleaseManifest;
+import cn.dreamingfish.updater.protocol.PlayerMusicTrack;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Base64;
+import java.util.List;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+class PublishServiceTest {
+    @TempDir
+    Path temporary;
+
+    @Test
+    void manySequentialObjectsUseOnePeakReservationAndReleaseTemporaryOwnership()throws Exception {
+        var fixture=new ManagementFixture(temporary);fixture.createProject();
+        for(int i=0;i<100;i++)Files.writeString(fixture.source.resolve("file-"+i+".txt"),"payload-"+i+"x".repeat(64));
+        String oldBytes=System.getProperty("dfs.storage.stagingBytes"),oldConcurrent=System.getProperty("dfs.storage.concurrent");
+        try {
+            System.setProperty("dfs.storage.stagingBytes","128");System.setProperty("dfs.storage.concurrent","1");
+            fixture.scanner.createPreview("demo");var release=fixture.publisher.publish("demo","1.0.0","0.2.1","one bounded stream");
+            assertEquals(100,fixture.database.readManifest(release).files().size());
+            try(var locks=Files.list(fixture.paths.locks())){assertEquals(1,locks.filter(path->path.getFileName().toString().matches("storage-[a-f0-9-]{36}\\.lock")).count(),"one batch must not leave a lock file per content object");}
+            try(var leases=Files.list(fixture.paths.root().resolve("storage-leases"))){assertEquals(0,leases.count());}
+        } finally {
+            if(oldBytes==null)System.clearProperty("dfs.storage.stagingBytes");else System.setProperty("dfs.storage.stagingBytes",oldBytes);
+            if(oldConcurrent==null)System.clearProperty("dfs.storage.concurrent");else System.setProperty("dfs.storage.concurrent",oldConcurrent);
+        }
+    }
+
+    @Test
+    void carriesTitleBarBrandingThroughBindingCoverAndPublishedManifest()
+            throws Exception {
+        ManagementFixture fixture = new ManagementFixture(temporary);
+        ProjectRecord project = fixture.createProject();
+        Branding old = project.branding();
+        Branding custom = new Branding(
+                old.productName(), old.subtitle(), old.serverAddress(), null,
+                old.accentColor(), old.secondaryAccentColor(),
+                "星河服", "StarRiver");
+        project = fixture.projects.configure(
+                project.id(), null, null, custom, null);
+
+        Path cover = temporary.resolve("cover.png");
+        Files.writeString(cover, "cover-content");
+        project = fixture.projects.setCover(project.id(), cover);
+        assertEquals("星河服", project.branding().brandName());
+        assertEquals("StarRiver", project.branding().brandEnglishName());
+        assertEquals("星河服", fixture.projects.bindingFor(
+                project, "DreamingFishUpdater", null)
+                .fallbackBranding().brandName());
+
+        Files.writeString(fixture.source.resolve("options.txt"), "music:1");
+        fixture.scanner.createPreview(project.id());
+        StoredRelease release = fixture.publisher.publish(
+                project.id(), "1.0.0", "0.1.0", "Brand test");
+        Branding published = fixture.database.readManifest(release).branding();
+        assertEquals("星河服", published.brandName());
+        assertEquals("StarRiver", published.brandEnglishName());
+    }
+
+    @Test
+    void importsMultipleMusicTracksAndPublishesVerifiedObjects() throws Exception {
+        ManagementFixture fixture = new ManagementFixture(temporary);
+        ProjectRecord project = fixture.createProject();
+        Path first = temporary.resolve("theme.mp3");
+        Path second = temporary.resolve("ambient.mp3");
+        Files.write(first, new byte[]{'I', 'D', '3', 1, 2, 3, 4});
+        Files.write(second, new byte[]{'I', 'D', '3', 5, 6, 7, 8});
+
+        project = fixture.projects.addMusicTrack(
+                project.id(), "theme", "主题曲", "theme.mp3", first, false);
+        project = fixture.projects.addMusicTrack(
+                project.id(), "ambient", "环境音乐", "ambient.mp3", second, false);
+        assertEquals(2, project.branding().musicTracks().size());
+        assertEquals("theme", project.branding().musicTracks().getFirst().id());
+
+        Files.writeString(fixture.source.resolve("options.txt"), "music");
+        fixture.scanner.createPreview(project.id());
+        StoredRelease release = fixture.publisher.publish(
+                project.id(), "1.0.0", "0.1.0", "Music");
+        List<PlayerMusicTrack> tracks = fixture.database.readManifest(release)
+                .branding().musicTracks();
+        assertEquals(2, tracks.size());
+        for (PlayerMusicTrack track : tracks) {
+            fixture.objects.verify(fixture.objects.require(track.sha256()),
+                    track.sha256(), track.size());
+        }
+
+        project = fixture.projects.removeMusicTrack(project.id(), "theme");
+        assertEquals(List.of("ambient.mp3"), project.branding().musicTracks().stream()
+                .map(PlayerMusicTrack::fileName).toList());
+        project = fixture.projects.clearMusicTracks(project.id());
+        assertTrue(project.branding().musicTracks().isEmpty());
+    }
+
+    @Test
+    void publishesSignedImmutableReleasesAndRollsBackAsANewRelease() throws Exception {
+        ManagementFixture fixture = new ManagementFixture(temporary);
+        ProjectRecord project = fixture.createProject();
+        Files.createDirectories(fixture.source.resolve("mods"));
+        Files.writeString(fixture.source.resolve("mods/example.jar"), "version-one");
+        Files.writeString(fixture.source.resolve("options.txt"), "music:1");
+        Files.writeString(fixture.source.resolve("servers.dat"), "server-list");
+
+        PublishPreview firstPreview = fixture.scanner.createPreview("demo");
+        assertEquals(3, firstPreview.changes().size());
+        assertEquals(FilePolicy.ENFORCED,
+                firstPreview.files().stream().filter(file -> file.path().equals("options.txt")).findFirst().orElseThrow().policy());
+        assertEquals(FilePolicy.ENFORCED,
+                firstPreview.files().stream().filter(file -> file.path().equals("servers.dat")).findFirst().orElseThrow().policy());
+        StoredRelease first = fixture.publisher.publish("demo", "1.0.0", "0.1.0", "First release");
+        assertEquals(1, first.sequence());
+
+        byte[] manifestBytes = Files.readAllBytes(first.manifestPath());
+        assertTrue(CryptoSupport.verify(
+                manifestBytes,
+                Base64.getDecoder().decode(first.signature()),
+                CryptoSupport.decodePublicKey(project.publicKey())
+        ));
+        ReleaseManifest firstManifest = fixture.database.readManifest(first);
+        assertEquals(3, firstManifest.files().size());
+        for (var file : firstManifest.files()) {
+            fixture.objects.verify(fixture.objects.require(file.sha256()), file.sha256(), file.size());
+        }
+
+        Files.writeString(fixture.source.resolve("mods/example.jar"), "version-two");
+        fixture.scanner.createPreview("demo");
+        StoredRelease second = fixture.publisher.publish("demo", "2.0.0", "0.1.0", "Second release");
+        assertEquals(2, second.sequence());
+        assertNotEquals(first.releaseId(), second.releaseId());
+
+        StoredRelease rollback = fixture.publisher.rollback("demo", first.releaseId(), "2.0.1", "Restore v1 content");
+        assertEquals(3, rollback.sequence());
+        assertEquals(firstManifest.files(), fixture.database.readManifest(rollback).files());
+        assertEquals(3, fixture.database.listReleases("demo").size());
+    }
+
+    @Test
+    void refusesToPublishWhenSourceChangedAfterPreview() throws Exception {
+        ManagementFixture fixture = new ManagementFixture(temporary);
+        fixture.createProject();
+        Files.createDirectories(fixture.source.resolve("config"));
+        Path config = fixture.source.resolve("config/server.toml");
+        Files.writeString(config, "enabled=true", StandardCharsets.UTF_8);
+        fixture.scanner.createPreview("demo");
+        Files.writeString(config, "enabled=false", StandardCharsets.UTF_8);
+
+        ManagementException error = assertThrows(ManagementException.class,
+                () -> fixture.publisher.publish("demo", "1.0.0", "0.1.0", "Changed"));
+        assertTrue(error.getMessage().contains("changed"));
+        assertTrue(fixture.database.listReleases("demo").isEmpty());
+    }
+
+    @Test
+    void refusesSourceDirectoryInsideManagementData() throws Exception {
+        ManagementFixture fixture = new ManagementFixture(temporary);
+        assertThrows(ManagementException.class, () -> fixture.projects.create(
+                "unsafe", "Unsafe", fixture.paths.objects(), "http://127.0.0.1:8080",
+                null, null
+        ));
+    }
+
+    @Test
+    void refusesToScanAMissingForcedDirectoryButAllowsAnExplicitEmptyDirectory() throws Exception {
+        ManagementFixture fixture = new ManagementFixture(temporary);
+        ProjectRecord project = fixture.createProject();
+        fixture.projects.configure("demo", null, null, null,
+                project.rules().withLegacyForcedSyncDirectories(java.util.List.of("mods")));
+
+        assertThrows(ManagementException.class,
+                () -> fixture.scanner.createPreview("demo"));
+
+        Files.createDirectories(fixture.source.resolve("mods"));
+        fixture.scanner.createPreview("demo");
+        StoredRelease release = fixture.publisher.publish(
+                "demo", "1.0.0", "0.1.4", "Empty forced mods");
+        ReleaseManifest manifest = fixture.database.readManifest(release);
+        assertEquals(java.util.List.of("mods"), manifest.cleanupDirectories());
+        assertTrue(manifest.forcedSyncDirectories().isEmpty());
+        assertEquals("0.2.0", manifest.minimumPlayerVersion());
+        assertTrue(manifest.requiredCapabilities().contains(
+                cn.dreamingfish.updater.protocol.ProtocolConstants
+                        .CAPABILITY_MAINTENANCE_POLICY));
+    }
+
+    @Test
+    void automaticallyPublishesStableModMetadataFromTheJar() throws Exception {
+        ManagementFixture fixture = new ManagementFixture(temporary);
+        fixture.createProject();
+        Path jar = fixture.source.resolve("mods/render-helper.jar");
+        Files.createDirectories(jar.getParent());
+        try (ZipOutputStream output = new ZipOutputStream(Files.newOutputStream(jar))) {
+            output.putNextEntry(new ZipEntry("META-INF/mods.toml"));
+            output.write("""
+                    modLoader="javafml"
+                    loaderVersion="[47,)"
+                    license="MIT"
+                    [[mods]]
+                    modId="render_helper"
+                    displayName="渲染兼容助手"
+                    version="1.0"
+                    """.getBytes(StandardCharsets.UTF_8));
+            output.closeEntry();
+        }
+
+        fixture.scanner.createPreview("demo");
+        StoredRelease stored = fixture.publisher.publish(
+                "demo", "1.0.0", "0.1.7", "metadata");
+        var file = fixture.database.readManifest(stored).files().getFirst();
+
+        assertEquals("render_helper", file.componentId());
+        assertEquals("渲染兼容助手", file.displayName());
+    }
+
+    @Test
+    void requiresAnExplicitRemovalDecisionAndCarriesReleasedPathsForward()
+            throws Exception {
+        ManagementFixture fixture = new ManagementFixture(temporary);
+        fixture.createProject();
+        Path legacy = fixture.source.resolve("mods/legacy-renderer.jar");
+        Files.createDirectories(legacy.getParent());
+        Files.writeString(legacy, "legacy");
+        fixture.scanner.createPreview("demo");
+        fixture.publisher.publish(
+                "demo", "1.0.0", "0.1.0", "initial");
+
+        Files.delete(legacy);
+        PublishPreview removed = fixture.scanner.createPreview("demo");
+        PreviewChange change = removed.changes().stream()
+                .filter(item -> item.kind() == ChangeKind.REMOVED)
+                .findFirst().orElseThrow();
+        assertEquals(RemovalAction.DELETE, change.removalAction());
+
+        fixture.scanner.decideRemovals("demo", java.util.List.of(
+                new RemovalDecision(
+                        "mods/legacy-renderer.jar", RemovalAction.RELEASE)));
+        StoredRelease second = fixture.publisher.publish(
+                "demo", "2.0.0", "0.1.13", "release ownership");
+        ReleaseManifest secondManifest = fixture.database.readManifest(second);
+        assertEquals(java.util.List.of("mods/legacy-renderer.jar"),
+                secondManifest.releasedPaths());
+        assertTrue(secondManifest.requiredCapabilities().contains(
+                cn.dreamingfish.updater.protocol.ProtocolConstants
+                        .CAPABILITY_RELEASED_PATHS));
+
+        fixture.scanner.createPreview("demo");
+        StoredRelease third = fixture.publisher.publish(
+                "demo", "3.0.0", "0.1.13", "carry release");
+        assertEquals(java.util.List.of("mods/legacy-renderer.jar"),
+                fixture.database.readManifest(third).releasedPaths());
+
+        Files.writeString(legacy, "managed-again");
+        fixture.scanner.createPreview("demo");
+        StoredRelease fourth = fixture.publisher.publish(
+                "demo", "4.0.0", "0.1.13", "manage again");
+        assertTrue(fixture.database.readManifest(fourth)
+                .releasedPaths().isEmpty());
+    }
+
+    @Test
+    void publishesAndValidatesIndividualForcedSyncFiles() throws Exception {
+        ManagementFixture fixture = new ManagementFixture(temporary);
+        ProjectRecord project = fixture.createProject();
+        Path required = fixture.source.resolve("mods/server-required.jar");
+        Path optional = fixture.source.resolve("mods/optional-map.jar");
+        Files.createDirectories(required.getParent());
+        Files.writeString(required, "required");
+        Files.writeString(optional, "optional");
+        fixture.projects.configure(
+                "demo", null, null, null,
+                project.rules().withLegacyForcedSyncFiles(
+                        java.util.List.of("mods/server-required.jar")));
+
+        fixture.scanner.createPreview("demo");
+        StoredRelease release = fixture.publisher.publish(
+                "demo", "1.0.0", "0.1.13", "forced file");
+        ReleaseManifest manifest = fixture.database.readManifest(release);
+        java.util.Map<String, cn.dreamingfish.updater.protocol.MaintenancePreset> presets =
+                new java.util.HashMap<>();
+        manifest.files().forEach(file -> presets.put(file.path(), file.preset()));
+        assertEquals(cn.dreamingfish.updater.protocol.MaintenancePreset.REQUIRED,
+                presets.get("mods/server-required.jar"));
+        assertEquals(cn.dreamingfish.updater.protocol.MaintenancePreset.SYNC,
+                presets.get("mods/optional-map.jar"));
+        assertTrue(manifest.forcedSyncFiles().isEmpty());
+
+        // Deleting a required file is an ordinary removal; the stale rule is only reported.
+        Files.delete(required);
+        PublishPreview stale = fixture.scanner.createPreview("demo");
+        assertTrue(stale.warnings().stream().anyMatch(warning ->
+                warning.code().equals(PreviewWarning.STALE_RULE)
+                        && warning.subject().equals("mods/server-required.jar")));
+    }
+
+    @Test
+    void rollbackCarriesCurrentReleasedPathsUntilTheTargetManagesThemAgain() throws Exception {
+        ManagementFixture fixture = new ManagementFixture(temporary);
+        fixture.createProject();
+        fixture.scanner.createPreview("demo");
+        StoredRelease empty = fixture.publisher.publish("demo", "1.0.0", "0.1.0", "empty");
+        Path mod = fixture.source.resolve("mods/retired.jar");
+        Files.createDirectories(mod.getParent());
+        Files.writeString(mod, "old content");
+        fixture.scanner.createPreview("demo");
+        StoredRelease managed = fixture.publisher.publish("demo", "2.0.0", "0.1.0", "managed");
+        Files.delete(mod);
+        fixture.scanner.createPreview("demo");
+        fixture.scanner.decideRemovals("demo", List.of(new RemovalDecision("mods/retired.jar", RemovalAction.RELEASE)));
+        fixture.publisher.publish("demo", "3.0.0", "0.1.0", "released");
+        StoredRelease kept = fixture.publisher.rollback("demo", empty.releaseId(), "4.0.0", "empty rollback");
+        ReleaseManifest manifest = fixture.database.readManifest(kept);
+        assertEquals(List.of("mods/retired.jar"), manifest.releasedPaths());
+        assertTrue(manifest.requiredCapabilities().contains(
+                cn.dreamingfish.updater.protocol.ProtocolConstants.CAPABILITY_RELEASED_PATHS));
+        StoredRelease reclaimed = fixture.publisher.rollback("demo", managed.releaseId(), "5.0.0", "reclaim");
+        assertTrue(fixture.database.readManifest(reclaimed).releasedPaths().isEmpty());
+    }
+
+    @Test
+    void rejectsChangedRulesAndIncludesRuleChangesInAFreshPreview() throws Exception {
+        ManagementFixture fixture = new ManagementFixture(temporary);
+        ProjectRecord project = fixture.createProject();
+        Files.createDirectories(fixture.source.resolve("mods"));
+        Files.writeString(fixture.source.resolve("mods/official.jar"), "official");
+        fixture.scanner.createPreview("demo");
+        fixture.publisher.publish("demo", "1.0.0", "0.1.0", "ordinary");
+        PublishPreview old = fixture.scanner.createPreview("demo");
+        fixture.projects.configure("demo", null, null, null,
+                project.rules().withLegacyForcedSyncDirectories(List.of("mods")));
+        assertThrows(ManagementException.class, () -> fixture.publisher.publish("demo", "2.0.0", "0.1.0", "stale",
+                old.previewId(), old.confirmationDigest()));
+        PublishPreview fresh = fixture.scanner.createPreview("demo");
+        assertEquals(List.of(ChangeKind.POLICY_CHANGED),
+                fresh.changes().stream().map(PreviewChange::kind).toList());
+        assertEquals(List.of(
+                new PolicyChange("PRESET", "mods/official.jar", "SYNC", "REQUIRED"),
+                new PolicyChange("CLEANUP_DIRECTORY", "mods", null, "ON")), fresh.policyChanges());
+        fixture.publisher.publish("demo", "2.0.0", "0.1.0", "reviewed", fresh.previewId(), fresh.confirmationDigest());
+    }
+
+    @Test
+    void rejectsAChangedRemovalDecisionAndAReplacedPreview() throws Exception {
+        ManagementFixture fixture = new ManagementFixture(temporary);
+        fixture.createProject();
+        Path file = fixture.source.resolve("old.txt");
+        Files.writeString(file, "old");
+        fixture.scanner.createPreview("demo");
+        fixture.publisher.publish("demo", "1.0.0", "0.1.0", "initial");
+        Files.delete(file);
+        fixture.scanner.createPreview("demo");
+        PublishPreview release = fixture.scanner.decideRemovals("demo", List.of(new RemovalDecision("old.txt", RemovalAction.RELEASE)));
+        fixture.scanner.decideRemovals("demo", release.previewId(), release.confirmationDigest(),
+                List.of(new RemovalDecision("old.txt", RemovalAction.DELETE)));
+        assertThrows(ManagementException.class, () -> fixture.publisher.publish("demo", "2.0.0", "0.1.0", "stale",
+                release.previewId(), release.confirmationDigest()));
+        assertThrows(ManagementException.class, () -> fixture.scanner.decideRemovals("demo", release.previewId(),
+                release.confirmationDigest(), List.of(new RemovalDecision("old.txt", RemovalAction.RELEASE))));
+        PublishPreview confirmed = fixture.scanner.load("demo");
+        fixture.scanner.createPreview("demo");
+        assertThrows(ManagementException.class, () -> fixture.publisher.publish("demo", "2.0.0", "0.1.0", "stale",
+                confirmed.previewId(), confirmed.confirmationDigest()));
+        assertEquals(1, fixture.database.listReleases("demo").size());
+    }
+
+    @Test
+    void rollbackDeduplicatesReleasedPathsAfterFilenameCaseChanges() throws Exception {
+        ManagementFixture fixture = new ManagementFixture(temporary);
+        fixture.createProject();
+        Files.createDirectories(fixture.source.resolve("mods"));
+        Path upper = fixture.source.resolve("mods/A.jar");
+        Files.writeString(upper, "upper");
+        fixture.scanner.createPreview("demo");
+        fixture.publisher.publish("demo", "1.0.0", "0.1.0", "managed");
+        Files.delete(upper);
+        fixture.scanner.createPreview("demo");
+        fixture.scanner.decideRemovals("demo", List.of(new RemovalDecision("mods/A.jar", RemovalAction.RELEASE)));
+        StoredRelease released = fixture.publisher.publish("demo", "2.0.0", "0.1.0", "released");
+        Path lower = fixture.source.resolve("mods/a.jar");
+        Files.writeString(lower, "lower");
+        fixture.scanner.createPreview("demo");
+        fixture.publisher.publish("demo", "3.0.0", "0.1.0", "reclaimed");
+        Files.delete(lower);
+        fixture.scanner.createPreview("demo");
+        fixture.scanner.decideRemovals("demo", List.of(new RemovalDecision("mods/a.jar", RemovalAction.RELEASE)));
+        fixture.publisher.publish("demo", "4.0.0", "0.1.0", "released again");
+        StoredRelease rollback = fixture.publisher.rollback("demo", released.releaseId(), "5.0.0", "rollback");
+        assertEquals(List.of("mods/a.jar"), fixture.database.readManifest(rollback).releasedPaths());
+    }
+}

@@ -1,0 +1,35 @@
+[package]
+name = "dreamingfish-player"
+version = "0.2.2"
+description = "DreamingFish modpack player updater"
+authors = ["DreamingFish"]
+edition = "2021"
+
+[lib]
+name = "dreamingfish_player_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+base64 = "0.22"
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+open = "5"
+reqwest = { version = "=0.13.4", default-features = false, features = ["blocking"] }
+
+[target.'cfg(windows)'.dependencies]
+rfd = { version = "=0.16.0", default-features = false }
+
+[features]
+# Production builds embed the built frontend; without this feature Tauri treats
+# the app as a dev build and tries to load the dev server URL instead.
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

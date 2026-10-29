@@ -1,0 +1,21 @@
+<script setup lang="ts">
+import {onBeforeUnmount,onMounted,ref,watch} from 'vue';
+import {LocalApiError,operationMessage,type LocalLauncherClient} from './local-api';
+import type {TaskPage,TaskState} from './local-types';
+const props=defineProps<{client:LocalLauncherClient;revision?:number}>();const emit=defineEmits<{changed:[]}>();
+const page=ref<TaskPage|null>(null),error=ref(''),busy=ref(''),offset=ref(0),loading=ref(false);
+const labels:Record<TaskState,string>={QUEUED:'排队中',RESOLVING:'解析文件',DOWNLOADING:'下载中',VERIFYING:'校验文件',COMPLETED:'已完成',FAILED:'失败',CANCELLED:'已取消',INTERRUPTED:'已中断'};
+const active=(state:TaskState)=>!['COMPLETED','FAILED','CANCELLED','INTERRUPTED'].includes(state);
+let timer:ReturnType<typeof setTimeout>|undefined,request:AbortController|undefined,sequence=0,stopped=false;
+function clear(){clearTimeout(timer);timer=undefined;request?.abort();}
+async function load(){if(stopped||document.hidden)return;clear();request=new AbortController();const current=++sequence;loading.value=true;
+ try{const result=await props.client.tasks({offset:offset.value,limit:50},request.signal);if(current!==sequence)return;const previous=page.value;page.value=result;error.value='';if(result.tasks.some(now=>!active(now.state)&&!previous?.tasks.some(old=>old.id===now.id&&old.state===now.state)))emit('changed');if(result.tasks.some(t=>active(t.state)))timer=setTimeout(load,1000);}
+ catch(e){if(current!==sequence)return;if(e instanceof LocalApiError&&(e.status===401||e.status===403))stopped=true;if(!(e instanceof DOMException&&e.name==='AbortError'))error.value=operationMessage(e);}
+ finally{if(current===sequence)loading.value=false;}}
+async function action(id:string,kind:'cancel'|'retry'){if(busy.value)return;busy.value=id;clear();try{if(kind==='cancel')await props.client.cancelTask(id);else await props.client.retryTask(id);emit('changed');offset.value=0;await load();}catch(e){error.value=operationMessage(e);if(e instanceof LocalApiError&&(e.status===401||e.status===403))stopped=true;}finally{busy.value='';}}
+function visibility(){if(document.hidden){++sequence;clear();}else void load();}
+watch(()=>props.revision,()=>{offset.value=0;void load();});onMounted(()=>{void load();document.addEventListener('visibilitychange',visibility);});onBeforeUnmount(()=>{stopped=true;++sequence;clear();document.removeEventListener('visibilitychange',visibility);});
+</script>
+<template>
+ <section class="launcher-tasks launcher-glass"><div class="launcher-modal-title"><div><span class="launcher-overline">TASK CENTER</span><h2>下载与校验任务</h2></div><button class="launcher-secondary" :disabled="loading||!!busy" data-refresh-tasks @click="load">刷新 ↻</button></div><p v-if="error" class="launcher-inline-notice" role="alert">{{error}}</p><p v-if="page&&!page.tasks.length" class="launcher-caption">还没有任务。选择实例安装游戏文件，或到模组中心下载。</p><div v-for="task in page?.tasks" :key="task.id" :data-task-id="task.id" :data-task-state="task.state" class="launcher-task-row"><div><strong>{{task.inputs.versionId||task.inputs.entryId||'文件校验'}}</strong><span class="launcher-mini-tag">{{labels[task.state]}}</span><small>{{task.kind.includes('VERIFY')?'校验文件':`${(task.downloadedBytes/1048576).toFixed(2)} MiB${task.totalBytes!==null?' / '+(task.totalBytes/1048576).toFixed(2)+' MiB':''}`}} · {{task.completedFiles}} / {{task.totalFiles??'—'}} 文件</small><small v-if="task.message">{{task.message}}</small><small v-if="task.errorCode" class="launcher-task-error">{{task.errorCode}}</small></div><button v-if="active(task.state)" class="launcher-secondary" data-cancel-task :disabled="!!busy" @click="action(task.id,'cancel')">取消</button><button v-if="['FAILED','CANCELLED','INTERRUPTED'].includes(task.state)" class="launcher-secondary" data-retry-task :disabled="!!busy" @click="action(task.id,'retry')">重试</button></div><p v-for="problem in page?.problems" :key="problem.recordId" class="launcher-caption">{{problem.recordId}} · {{problem.reason}}</p><div v-if="page&&page.total>50" class="launcher-task-pagination"><button class="launcher-secondary" :disabled="!offset||loading" @click="offset=Math.max(0,offset-50);load()">上一页</button><span>{{offset+1}}–{{Math.min(offset+50,page.total)}} / {{page.total}}</span><button class="launcher-secondary" :disabled="offset+50>=page.total||loading" @click="offset+=50;load()">下一页</button></div></section>
+</template>

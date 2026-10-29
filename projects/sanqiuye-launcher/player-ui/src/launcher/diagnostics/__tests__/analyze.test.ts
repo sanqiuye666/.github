@@ -1,0 +1,13 @@
+import {describe,it,expect} from 'vitest';
+import {analyzeLaunch,diagnosisText} from '../analyze';
+import type {LaunchSnapshot} from '../../launch-types';
+const run=(patch:Partial<LaunchSnapshot>={}):LaunchSnapshot=>({id:'local-run',instanceId:'instance',installationId:'install',state:'EXITED',createdAt:'2026-10-24T00:00:00Z',startedAt:null,endedAt:null,exitCode:1,errorCode:null,message:'exit',...patch});
+const sample=(lines:string[]=[])=>({lines,partial:false,readError:false});
+describe('只读运行诊断',()=>{
+ it('正常退出、取消和运行中不按日志词语误判崩溃',()=>{for(const [r,status] of [[run({exitCode:0}),'normal'],[run({state:'CANCELLED'}),'cancelled'],[run({state:'RUNNING',exitCode:null}),'pending'],[run({state:'UNCERTAIN'}),'pending']] as const){const result=analyzeLaunch(r,sample(['java.lang.OutOfMemoryError']));expect(result.status).toBe(status);expect(result.findings).toEqual([]);}});
+ it('访问冲突只识别退出类型，不猜显卡/路径为确定根因',()=>{const report=analyzeLaunch(run({exitCode:-1073741819}),sample());expect(report.findings[0]?.code).toBe('NATIVE_ACCESS_VIOLATION');expect(report.findings[0]?.reason).toContain('尚不能确定');expect(report.findings[0]?.confidence).toBe('recognized');});
+ it.each([['java.lang.OutOfMemoryError: Java heap space','MEMORY'],['java.lang.UnsupportedClassVersionError: unsupported','JAVA_VERSION'],['java.lang.NoClassDefFoundError: example/Mod','MISSING_CLASS'],['Incompatible mods found!','MOD_DEPENDENCY'],['GLFW error 65542: WGL: driver does not support OpenGL','OPENGL'],['java.nio.file.AccessDeniedException: private/file','FILE_ACCESS']])('日志标记 %s 给出候选而非自动修复', (line,code)=>{const report=analyzeLaunch(run(),sample([line]));expect(report.findings.some(f=>f.code===code&&f.confidence==='possible')).toBe(true);});
+ it('未知码不编造原因，后端缺Java错误仍有明确建议',()=>{expect(analyzeLaunch(run({exitCode:33}),sample()).findings[0]?.code).toBe('UNKNOWN_EXIT');expect(analyzeLaunch(run({state:'FAILED',exitCode:null,errorCode:'JAVA_NOT_FOUND'}),sample()).findings[0]?.code).toBe('JAVA_NOT_FOUND');});
+ it('不把原始凭据/路径/HTML带入报告或复制文本',()=>{const report=analyzeLaunch(run({message:'password=hidden-source'}),sample(['java.lang.OutOfMemoryError: access_token=private-value <script>alert(1)</script> C:/private/player']));const text=JSON.stringify(report)+diagnosisText(report,'1.20.6');for(const word of ['private-value','hidden-source','<script>','C:/private'])expect(text).not.toContain(word);});
+ it('超长片段截断并标记不全，不扫描预算外的标记',()=>{const result=analyzeLaunch(run(),sample(['x'.repeat(131073)+'java.lang.OutOfMemoryError']));expect(result.partial).toBe(true);expect(result.findings.some(f=>f.code==='MEMORY')).toBe(false);});
+});

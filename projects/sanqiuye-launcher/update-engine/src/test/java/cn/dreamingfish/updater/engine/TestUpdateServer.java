@@ -1,0 +1,429 @@
+package cn.dreamingfish.updater.engine;
+
+import cn.dreamingfish.updater.protocol.Branding;
+import cn.dreamingfish.updater.protocol.CryptoSupport;
+import cn.dreamingfish.updater.protocol.FilePolicy;
+import cn.dreamingfish.updater.protocol.JsonCodec;
+import cn.dreamingfish.updater.protocol.ManifestFile;
+import cn.dreamingfish.updater.protocol.ProjectBinding;
+import cn.dreamingfish.updater.protocol.ProtocolConstants;
+import cn.dreamingfish.updater.protocol.PlayerProgramFile;
+import cn.dreamingfish.updater.protocol.PlayerProgramManifest;
+import cn.dreamingfish.updater.protocol.ReleaseManifest;
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.KeyPair;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+
+final class TestUpdateServer implements AutoCloseable {
+    private final JsonCodec json = new JsonCodec();
+    private final KeyPair keys = CryptoSupport.generateEd25519KeyPair();
+    private final Map<String, byte[]> objects = new HashMap<>();
+    private final HttpServer server;
+    private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+
+    private volatile byte[] manifestBytes;
+    private volatile String signature;
+    private volatile byte[] playerManifestBytes;
+    private volatile String playerSignature;
+    volatile boolean invalidSignature;
+    volatile boolean signatureSidecarsOnly;
+    volatile boolean unavailable;
+    final java.util.concurrent.atomic.AtomicInteger overloadedObjectResponses=new java.util.concurrent.atomic.AtomicInteger();
+    volatile String lastRange;
+    volatile long objectDelayMillis;
+    final AtomicInteger activeObjectRequests = new AtomicInteger();
+    final AtomicInteger maximumConcurrentObjectRequests = new AtomicInteger();
+
+    TestUpdateServer() throws IOException {
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 16);
+        server.setExecutor(executor);
+        server.createContext("/", this::handle);
+        server.start();
+    }
+
+    ProjectBinding binding() {
+        return new ProjectBinding(ProtocolConstants.BINDING_SCHEMA_VERSION, "demo",
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/",
+                CryptoSupport.encodePublicKey(keys.getPublic()), "DreamingFishUpdater",
+                null, Branding.empty());
+    }
+
+    TestFile file(String path, String text, FilePolicy policy) {
+        byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+        String hash = CryptoSupport.sha256(bytes);
+        objects.put(hash, bytes);
+        return new TestFile(path, bytes, hash, policy, null, null);
+    }
+
+    TestFile mod(String path, String text, FilePolicy policy,
+                 String componentId, String displayName) {
+        byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+        String hash = CryptoSupport.sha256(bytes);
+        objects.put(hash, bytes);
+        return new TestFile(path, bytes, hash, policy, componentId, displayName);
+    }
+
+    ReleaseManifest release(long sequence, String id, TestFile... testFiles) {
+        return release(sequence, id, List.of(), testFiles);
+    }
+
+    ReleaseManifest release(long sequence, String id, List<String> forcedSyncDirectories,
+                            TestFile... testFiles) {
+        return release(sequence, id, forcedSyncDirectories,
+                List.of(), List.of(), testFiles);
+    }
+
+    ReleaseManifest release(long sequence, String id,
+                            List<String> forcedSyncDirectories,
+                            List<String> forcedSyncFiles,
+                            List<String> releasedPaths,
+                            TestFile... testFiles) {
+        List<ManifestFile> files = new ArrayList<>();
+        for (TestFile file : testFiles) {
+            files.add(new ManifestFile(file.path(), file.sha256(), file.bytes().length,
+                    file.policy(), false, file.componentId(), file.displayName()));
+        }
+        files.sort(Comparator.comparing(ManifestFile::path));
+        Set<String> capabilities = new java.util.HashSet<>();
+        if (!forcedSyncDirectories.isEmpty()) {
+            capabilities.add(ProtocolConstants.CAPABILITY_FORCED_DIRECTORY_SYNC);
+        }
+        if (!forcedSyncFiles.isEmpty()) {
+            capabilities.add(ProtocolConstants.CAPABILITY_FORCED_FILE_SYNC);
+        }
+        if (!releasedPaths.isEmpty()) {
+            capabilities.add(ProtocolConstants.CAPABILITY_RELEASED_PATHS);
+        }
+        return new ReleaseManifest(ProtocolConstants.RELEASE_SCHEMA_VERSION, "demo", id,
+                sequence, Instant.now(), "1.0." + sequence, "0.1.0", "release " + sequence,
+                capabilities, forcedSyncDirectories, forcedSyncFiles, releasedPaths,
+                Branding.empty(), files);
+    }
+
+    void serve(ReleaseManifest manifest) {
+        manifestBytes = json.write(manifest);
+        signature = Base64.getEncoder().encodeToString(CryptoSupport.sign(manifestBytes, keys.getPrivate()));
+        invalidSignature = false;
+        unavailable = false;
+        lastRange = null;
+        activeObjectRequests.set(0);
+        maximumConcurrentObjectRequests.set(0);
+    }
+
+    void bundle(Path instance, ReleaseManifest manifest, boolean materializeFiles) throws IOException {
+        byte[] bytes = json.write(manifest);
+        String bundledSignature = Base64.getEncoder().encodeToString(
+                CryptoSupport.sign(bytes, keys.getPrivate()));
+        Path directory = Files.createDirectories(
+                instance.resolve(".dreamingfish-bootstrap/bundled-release"));
+        Files.write(directory.resolve("manifest.json"), bytes);
+        Files.writeString(directory.resolve("manifest.sig"), bundledSignature + "\n",
+                StandardCharsets.US_ASCII);
+        if (materializeFiles) {
+            for (ManifestFile file : manifest.files()) {
+                byte[] content = objects.get(file.sha256());
+                if (content == null) throw new IOException("Missing test object " + file.sha256());
+                Path target = instance.resolve(file.path().replace('/', java.io.File.separatorChar));
+                Files.createDirectories(target.getParent());
+                Files.write(target, content);
+            }
+            for (String forced : manifest.forcedSyncDirectories()) {
+                Files.createDirectories(instance.resolve(forced));
+            }
+        }
+    }
+
+    PlayerProgramFile playerFile(String path, String text, boolean executable) {
+        byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+        String hash = CryptoSupport.sha256(bytes);
+        objects.put(hash, bytes);
+        return new PlayerProgramFile(path, hash, bytes.length, executable);
+    }
+
+    PlayerProgramManifest playerProgram(String version, String launchPath,
+                                        PlayerProgramFile... programFiles) {
+        List<PlayerProgramFile> files = new ArrayList<>(List.of(programFiles));
+        files.sort(Comparator.comparing(PlayerProgramFile::path));
+        return new PlayerProgramManifest(ProtocolConstants.PLAYER_PROGRAM_SCHEMA_VERSION,
+                "demo", "windows-x64", version, Instant.now(), launchPath,
+                "0.1.0", Set.of(), files);
+    }
+
+    void servePlayerProgram(PlayerProgramManifest manifest) {
+        playerManifestBytes = json.write(manifest);
+        playerSignature = Base64.getEncoder().encodeToString(
+                CryptoSupport.sign(playerManifestBytes, keys.getPrivate()));
+        invalidSignature = false;
+        unavailable = false;
+        lastRange = null;
+        activeObjectRequests.set(0);
+        maximumConcurrentObjectRequests.set(0);
+    }
+
+    void tamperObject(String hash, String replacement) {
+        objects.put(hash, replacement.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private void handle(HttpExchange exchange) throws IOException {
+        try {
+            if (unavailable) {
+                send(exchange, 503, "unavailable".getBytes(StandardCharsets.UTF_8));
+                return;
+            }
+            String path = exchange.getRequestURI().getPath();
+            if (path.equals("/v1/projects/demo/latest")) {
+                if (!signatureSidecarsOnly) {
+                    exchange.getResponseHeaders().set(ProtocolConstants.SIGNATURE_HEADER,
+                            invalidSignature ? Base64.getEncoder().encodeToString(new byte[64]) : signature);
+                }
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                send(exchange, 200, manifestBytes);
+                return;
+            }
+            if (path.equals("/v1/projects/demo/latest.sig")) {
+                send(exchange, 200, ((invalidSignature
+                        ? Base64.getEncoder().encodeToString(new byte[64]) : signature) + "\n")
+                        .getBytes(StandardCharsets.US_ASCII));
+                return;
+            }
+            if (path.equals("/v1/projects/demo/player/windows-x64/latest")) {
+                if (playerManifestBytes == null) {
+                    send(exchange, 404, new byte[0]);
+                    return;
+                }
+                if (!signatureSidecarsOnly) {
+                    exchange.getResponseHeaders().set(ProtocolConstants.SIGNATURE_HEADER,
+                            invalidSignature ? Base64.getEncoder().encodeToString(new byte[64]) : playerSignature);
+                }
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                send(exchange, 200, playerManifestBytes);
+                return;
+            }
+            if (path.equals("/v1/projects/demo/player/windows-x64/latest.sig")) {
+                if (playerSignature == null) {
+                    send(exchange, 404, new byte[0]);
+                    return;
+                }
+                send(exchange, 200, ((invalidSignature
+                        ? Base64.getEncoder().encodeToString(new byte[64]) : playerSignature) + "\n")
+                        .getBytes(StandardCharsets.US_ASCII));
+                return;
+            }
+            String prefix = "/v1/objects/sha256/";
+            if (path.startsWith(prefix)) {
+                serveObject(exchange, path.substring(prefix.length()));
+                return;
+            }
+            send(exchange, 404, new byte[0]);
+        } finally {
+            exchange.close();
+        }
+    }
+
+    private void serveObject(HttpExchange exchange, String hash) throws IOException {
+        int active = activeObjectRequests.incrementAndGet();
+        maximumConcurrentObjectRequests.accumulateAndGet(active, Math::max);
+        try {
+            if(overloadedObjectResponses.getAndUpdate(value->Math.max(0,value-1))>0){exchange.getResponseHeaders().set("Retry-After","0");send(exchange,503,new byte[0]);return;}
+            if (objectDelayMillis > 0) {
+                try {
+                    Thread.sleep(objectDelayMillis);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Test object response was interrupted", e);
+                }
+            }
+            byte[] object = objects.get(hash);
+            if (object == null) {
+                send(exchange, 404, new byte[0]);
+                return;
+            }
+            String range = exchange.getRequestHeaders().getFirst("Range");
+            lastRange = range;
+            if (range != null && range.matches("bytes=\\d+-")) {
+                int offset = Integer.parseInt(range.substring(6, range.length() - 1));
+                if (offset >= object.length) {
+                    exchange.getResponseHeaders().set("Content-Range", "bytes */" + object.length);
+                    send(exchange, 416, new byte[0]);
+                    return;
+                }
+                byte[] remainder = java.util.Arrays.copyOfRange(object, offset, object.length);
+                exchange.getResponseHeaders().set("Content-Range",
+                        "bytes " + offset + "-" + (object.length - 1) + "/" + object.length);
+                send(exchange, 206, remainder);
+                return;
+            }
+            send(exchange, 200, object);
+        } finally {
+            activeObjectRequests.decrementAndGet();
+        }
+    }
+
+    private static void send(HttpExchange exchange, int status, byte[] body) throws IOException {
+        exchange.sendResponseHeaders(status, body.length);
+        exchange.getResponseBody().write(body);
+    }
+
+    @Override
+    public void close() {
+        server.stop(0);
+        executor.close();
+    }
+
+    record TestFile(String path, byte[] bytes, String sha256, FilePolicy policy,
+                    String componentId, String displayName, String version) {
+        TestFile(String path, byte[] bytes, String sha256, FilePolicy policy,
+                 String componentId, String displayName) {
+            this(path, bytes, sha256, policy, componentId, displayName, null);
+        }
+
+        TestFile {
+            bytes = bytes.clone();
+        }
+
+        @Override
+        public byte[] bytes() {
+            return bytes.clone();
+        }
+    }
+
+    /** A real mod jar carrying fabric.mod.json, so local inspection reads its mod ID and version. */
+    TestFile jarMod(String path, String id, String version, String marker) {
+        byte[] bytes = jarBytes(id, version, marker);
+        String hash = CryptoSupport.sha256(bytes);
+        objects.put(hash, bytes);
+        return new TestFile(path, bytes, hash, FilePolicy.ENFORCED, id, id, version);
+    }
+
+    static byte[] jarBytes(String id, String version, String marker) {
+        java.io.ByteArrayOutputStream output = new java.io.ByteArrayOutputStream();
+        try (java.util.zip.ZipOutputStream zip = new java.util.zip.ZipOutputStream(output)) {
+            java.util.zip.ZipEntry entry = new java.util.zip.ZipEntry("fabric.mod.json");
+            entry.setTime(0);
+            zip.putNextEntry(entry);
+            zip.write(("{\"schemaVersion\":1,\"id\":\"" + id + "\",\"name\":\"" + id
+                    + "\",\"version\":\"" + version + "\"}").getBytes(StandardCharsets.UTF_8));
+            zip.closeEntry();
+            java.util.zip.ZipEntry content = new java.util.zip.ZipEntry("marker.txt");
+            content.setTime(0);
+            zip.putNextEntry(content);
+            zip.write(marker.getBytes(StandardCharsets.UTF_8));
+            zip.closeEntry();
+        } catch (IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        }
+        return output.toByteArray();
+    }
+
+    /** Builds a release using the preset-based maintenance model. */
+    PolicyRelease policy(long sequence, String id) {
+        return new PolicyRelease(sequence, id);
+    }
+
+    final class PolicyRelease {
+        private final long sequence;
+        private final String id;
+        private final List<ManifestFile> files = new ArrayList<>();
+        private final List<String> cleanup = new ArrayList<>();
+        private final List<cn.dreamingfish.updater.protocol.OptionalGroup> groups = new ArrayList<>();
+        private final List<String> released = new ArrayList<>();
+        private final List<String> retained = new ArrayList<>();
+        private final List<cn.dreamingfish.updater.protocol.Withdrawal> withdrawals = new ArrayList<>();
+        private final List<cn.dreamingfish.updater.protocol.Correction> corrections = new ArrayList<>();
+
+        private PolicyRelease(long sequence, String id) {
+            this.sequence = sequence;
+            this.id = id;
+        }
+
+        PolicyRelease file(TestFile file, cn.dreamingfish.updater.protocol.MaintenancePreset preset) {
+            return file(file, preset, null);
+        }
+
+        PolicyRelease file(TestFile file, cn.dreamingfish.updater.protocol.MaintenancePreset preset,
+                           String group) {
+            files.add(new ManifestFile(file.path(), file.sha256(), file.bytes().length,
+                    FilePolicy.ENFORCED, false, file.componentId(), file.displayName(),
+                    preset, group, file.version()));
+            return this;
+        }
+
+        PolicyRelease cleanup(String directory) {
+            cleanup.add(directory);
+            return this;
+        }
+
+        PolicyRelease group(String groupId, String title, boolean defaultInstall) {
+            groups.add(new cn.dreamingfish.updater.protocol.OptionalGroup(
+                    groupId, title, "", defaultInstall));
+            return this;
+        }
+
+        PolicyRelease released(String path) {
+            released.add(path);
+            return this;
+        }
+
+        PolicyRelease retained(String path) {
+            retained.add(path);
+            return this;
+        }
+
+        PolicyRelease withdraw(String withdrawalId, String reason, TestFile... versions) {
+            List<cn.dreamingfish.updater.protocol.WithdrawalItem> items = new ArrayList<>();
+            for (TestFile version : versions) {
+                items.add(new cn.dreamingfish.updater.protocol.WithdrawalItem(version.sha256(),
+                        version.bytes().length, version.path(), version.componentId(),
+                        version.version()));
+            }
+            withdrawals.add(new cn.dreamingfish.updater.protocol.Withdrawal(
+                    withdrawalId, reason, Instant.now(), items));
+            return this;
+        }
+
+        PolicyRelease correct(String correctionId, String path,
+                              cn.dreamingfish.updater.protocol.CorrectionMode mode,
+                              String reason, TestFile... badVersions) {
+            List<String> bad = new ArrayList<>();
+            for (TestFile version : badVersions) bad.add(version.sha256());
+            corrections.add(new cn.dreamingfish.updater.protocol.Correction(
+                    correctionId, path, mode, bad, reason, Instant.now()));
+            return this;
+        }
+
+        ReleaseManifest build() {
+            List<ManifestFile> sorted = new ArrayList<>(files);
+            sorted.sort(Comparator.comparing(ManifestFile::path));
+            Set<String> capabilities = new java.util.HashSet<>();
+            capabilities.add(ProtocolConstants.CAPABILITY_MAINTENANCE_POLICY);
+            if (!released.isEmpty()) capabilities.add(ProtocolConstants.CAPABILITY_RELEASED_PATHS);
+            ReleaseManifest manifest = new ReleaseManifest(ProtocolConstants.RELEASE_SCHEMA_VERSION,
+                    "demo", id, sequence, Instant.now(), "2.0." + sequence, "0.1.0",
+                    "release " + sequence, capabilities, List.of(), List.of(),
+                    released.stream().sorted().toList(), Branding.empty(), sorted,
+                    cleanup.stream().sorted().toList(), groups, retained.stream().sorted().toList(),
+                    withdrawals, corrections);
+            cn.dreamingfish.updater.protocol.ManifestValidator.validateRelease(manifest, Set.of(
+                    ProtocolConstants.CAPABILITY_MAINTENANCE_POLICY,
+                    ProtocolConstants.CAPABILITY_RELEASED_PATHS));
+            return manifest;
+        }
+    }
+}

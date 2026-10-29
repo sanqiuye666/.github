@@ -1,0 +1,368 @@
+package cn.dreamingfish.updater.management;
+
+import cn.dreamingfish.updater.protocol.Branding;
+import cn.dreamingfish.updater.protocol.ManifestValidator;
+import cn.dreamingfish.updater.protocol.PathSafety;
+import cn.dreamingfish.updater.protocol.PlayerMusicTrack;
+import cn.dreamingfish.updater.protocol.ProjectBinding;
+import cn.dreamingfish.updater.protocol.ProtocolConstants;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.LinkOption;
+import java.time.Instant;
+import java.util.List;
+import java.util.Locale;
+import java.util.ArrayList;
+
+public final class ProjectService {
+    private static final int MAX_MUSIC_TRACKS = 100;
+    private static final long MAX_MUSIC_BYTES = 20L * 1024L * 1024L;
+    private final ManagementPaths paths;
+    private final ManagementDatabase database;
+    private final ProjectKeyStore keys;
+    private final ObjectStore objects;
+
+    public ProjectService(ManagementPaths paths, ManagementDatabase database) {
+        this.paths = paths;
+        this.database = database;
+        this.keys = new ProjectKeyStore(paths);
+        this.objects = new ObjectStore(paths);
+    }
+
+    public ProjectRecord create(String id, String displayName, Path sourceDirectory,
+                                String publicBaseUrl, Branding branding, ProjectRules rules) {
+        validateProjectId(id);
+        try(ProjectLock catalog=ProjectLock.acquire(paths.locks().resolve("projects-catalog.lock"));ProjectLock projectLock=ProjectLock.acquire(paths.locks().resolve(id+".lock"))){
+        String name = normalizeDisplayName(displayName);
+        Path source = validateSource(sourceDirectory);
+        String baseUrl = normalizeOptionalBaseUrl(publicBaseUrl);
+        SourceDirectoryCheck.requireReadable(source);requireIndependentSource(id,source);
+        ProjectKeyStore.KeyMaterial key = keys.create(id);
+        ProjectRecord project = new ProjectRecord(
+                id,
+                name,
+                source,
+                baseUrl,
+                key.publicKey(),
+                key.privateKeyFile(),
+                branding == null ? Branding.empty() : branding,
+                rules == null ? ProjectRules.defaults() : rules,
+                1,
+                Instant.now()
+        );
+        try {
+            validateBinding(project);
+            database.insertProject(project);
+            return project;
+        } catch (RuntimeException e) {
+            try {
+                Files.deleteIfExists(key.privateKeyFile());
+            } catch (IOException cleanupFailure) {
+                e.addSuppressed(cleanupFailure);
+            }
+            throw e;
+        }
+            }catch(IOException error){throw new ManagementException("Unable to lock project creation",error);}
+    }
+
+    public ProjectRecord configure(String id, Path sourceDirectory, String publicBaseUrl,
+                                   Branding branding, ProjectRules rules) {
+        return configure(id, null, sourceDirectory, publicBaseUrl, branding, rules);
+    }
+
+    public ProjectRecord configure(String id, String displayName, Path sourceDirectory,
+                                   String publicBaseUrl, Branding branding, ProjectRules rules) {
+        validateProjectId(id);
+        try (ProjectLock catalog=ProjectLock.acquire(paths.locks().resolve("projects-catalog.lock"));ProjectLock ignored = ProjectLock.acquire(paths.locks().resolve(id + ".lock"))) {
+            return configureLocked(id, displayName, sourceDirectory, publicBaseUrl, branding, rules);
+        } catch (IOException error) { throw new ManagementException("Unable to lock project configuration", error); }
+    }
+
+    private ProjectRecord configureLocked(String id, String displayName, Path sourceDirectory,
+                                          String publicBaseUrl, Branding branding, ProjectRules rules) {
+        ProjectRecord current = database.requireProject(id);
+        String name = displayName == null
+                ? current.displayName() : normalizeDisplayName(displayName);
+        Path source = sourceDirectory == null ? current.sourceDirectory() : validateSource(sourceDirectory);
+        String url = publicBaseUrl == null ? current.publicBaseUrl() : normalizeOptionalBaseUrl(publicBaseUrl);
+        if (!source.equals(current.sourceDirectory())) SourceDirectoryCheck.requireReadable(source);
+        requireIndependentSource(id,source);
+        Branding nextBranding = branding == null ? current.branding() : branding;
+        ProjectRules nextRules = rules == null ? current.rules() : rules;
+        ProjectRecord candidate = new ProjectRecord(
+                current.id(), name, source, url, current.publicKey(), current.privateKeyFile(),
+                nextBranding, nextRules, current.nextSequence(), current.createdAt()
+        );
+        validateBinding(candidate);
+        new RuleSet(nextRules);
+        database.updateProject(id, name, source, url, nextBranding, nextRules);
+        return database.requireProject(id);
+    }
+
+    private void requireIndependentSource(String id,Path source) {
+        for(var other:database.listProjects())if(!other.id().equals(id)&&(source.startsWith(other.sourceDirectory())||other.sourceDirectory().startsWith(source)))
+            throw new ManagementException("项目标准目录不能与另一个项目共用或重叠："+other.id()+"（"+other.sourceDirectory()+"）");
+    }
+
+    public ProjectBinding bindingFor(ProjectRecord project, String playerHome, String bundledCoverPath) {
+        requirePublicBaseUrl(project, "生成玩家端配置");
+        return new ProjectBinding(
+                ProtocolConstants.BINDING_SCHEMA_VERSION,
+                project.id(),
+                project.publicBaseUrl(),
+                project.publicKey(),
+                playerHome,
+                bundledCoverPath,
+                project.branding()
+        );
+    }
+
+    public List<ProjectRecord> list() {
+        return database.listProjects();
+    }
+
+    public ProjectRecord setCover(String id, Path coverFile) {
+        validateProjectId(id);
+        try (ProjectLock ignored = ProjectLock.acquire(paths.locks().resolve(id + ".lock"))) {
+            return setCoverLocked(id, coverFile);
+        } catch (IOException error) { throw new ManagementException("Unable to lock project cover", error); }
+    }
+
+    private ProjectRecord setCoverLocked(String id, Path coverFile) {
+        if (!Files.isRegularFile(coverFile)) {
+            throw new ManagementException("Cover image does not exist: " + coverFile);
+        }
+        ProjectRecord current = database.requireProject(id);
+        ObjectStore.ObjectInfo cover = objects.importFile(coverFile);
+        Branding old = current.branding();
+        Branding branding = old.withCoverObject(cover.sha256());
+        database.updateProject(id, current.displayName(), current.sourceDirectory(),
+                current.publicBaseUrl(), branding, current.rules());
+        return database.requireProject(id);
+    }
+
+    /** Imports an MP3 into the content-addressed object store and adds it to the project playlist. */
+    public ProjectRecord addMusicTrack(String id, String trackId, String title,
+                                       String fileName, Path source, boolean overwrite) {
+        ProjectRecord current = database.requireProject(id);
+        if (source == null || !Files.isRegularFile(source)) {
+            throw new ManagementException("Music source file does not exist: " + source);
+        }
+        if (Files.isSymbolicLink(source)) {
+            throw new ManagementException("Music source file cannot be a symbolic link: " + source);
+        }
+        try {
+            long size = Files.size(source);
+            if (size == 0 || size > MAX_MUSIC_BYTES) {
+                throw new ManagementException("Music file must be between 1 byte and 20 MiB");
+            }
+            if (!looksLikeMp3(source)) {
+                throw new ManagementException("Music source is not a valid MP3 file");
+            }
+        } catch (IOException e) {
+            throw new ManagementException("Unable to inspect music source: " + source, e);
+        }
+        String normalizedFileName = normalizeMusicFileName(fileName);
+        String normalizedTitle = normalizeMusicTitle(title, normalizedFileName);
+        ObjectStore.ObjectInfo object = objects.importFile(source);
+        String normalizedId = normalizeMusicId(trackId, normalizedFileName, object.sha256());
+
+        List<PlayerMusicTrack> tracks = current.branding().musicTracks() == null
+                ? new ArrayList<>() : new ArrayList<>(current.branding().musicTracks());
+        if (tracks.size() > MAX_MUSIC_TRACKS) {
+            throw new ManagementException("A project cannot contain more than "
+                    + MAX_MUSIC_TRACKS + " music tracks");
+        }
+        int existing = -1;
+        for (int index = 0; index < tracks.size(); index++) {
+            PlayerMusicTrack track = tracks.get(index);
+            if (track.id().equalsIgnoreCase(normalizedId)) existing = index;
+            if (track.fileName().equalsIgnoreCase(normalizedFileName)
+                    && (existing < 0 || index != existing)) {
+                throw new ManagementException("Music file name is already in use: "
+                        + normalizedFileName);
+            }
+        }
+        if (existing >= 0 && !overwrite) {
+            throw new ManagementException("Music track already exists: " + normalizedId);
+        }
+        PlayerMusicTrack next = new PlayerMusicTrack(normalizedId, normalizedTitle,
+                normalizedFileName, object.sha256(), object.size());
+        if (existing >= 0) tracks.set(existing, next);
+        else tracks.add(next);
+        if (tracks.size() > MAX_MUSIC_TRACKS) {
+            throw new ManagementException("A project cannot contain more than "
+                    + MAX_MUSIC_TRACKS + " music tracks");
+        }
+        Branding branding = current.branding().withMusicTracks(List.copyOf(tracks));
+        return configure(id, current.displayName(), current.sourceDirectory(),
+                current.publicBaseUrl(), branding, current.rules());
+    }
+
+    public ProjectRecord removeMusicTrack(String id, String trackId) {
+        ProjectRecord current = database.requireProject(id);
+        String normalizedId = requiredMusicId(trackId);
+        List<PlayerMusicTrack> tracks = current.branding().musicTracks() == null
+                ? new ArrayList<>() : new ArrayList<>(current.branding().musicTracks());
+        boolean removed = tracks.removeIf(track -> track.id().equalsIgnoreCase(normalizedId));
+        if (!removed) throw new ManagementException("Unknown music track: " + normalizedId);
+        return configure(id, current.displayName(), current.sourceDirectory(),
+                current.publicBaseUrl(), current.branding().withMusicTracks(List.copyOf(tracks)),
+                current.rules());
+    }
+
+    /** Explicitly clears managed music. A null list remains reserved for legacy manifests. */
+    public ProjectRecord clearMusicTracks(String id) {
+        ProjectRecord current = database.requireProject(id);
+        return configure(id, current.displayName(), current.sourceDirectory(),
+                current.publicBaseUrl(), current.branding().withMusicTracks(List.of()),
+                current.rules());
+    }
+
+    private static String normalizeMusicFileName(String value) {
+        if (value == null || value.isBlank()) {
+            throw new ManagementException("Music file name cannot be empty");
+        }
+        String normalized;
+        try {
+            normalized = PathSafety.normalizeManifestPath(value.trim());
+        } catch (RuntimeException e) {
+            throw new ManagementException("Music file name is not safe: " + value, e);
+        }
+        if (normalized.indexOf('/') >= 0
+                || !normalized.toLowerCase(Locale.ROOT).endsWith(".mp3")) {
+            throw new ManagementException("Music file name must be a single .mp3 file name");
+        }
+        return normalized;
+    }
+
+    private static String normalizeMusicTitle(String value, String fileName) {
+        String result = value == null || value.isBlank()
+                ? fileName.substring(0, fileName.length() - 4) : value.trim();
+        if (result.isBlank() || result.length() > 120
+                || result.chars().anyMatch(Character::isISOControl)) {
+            throw new ManagementException("Music title is empty, too long, or contains control characters");
+        }
+        return result;
+    }
+
+    private static boolean looksLikeMp3(Path source) throws IOException {
+        byte[] header;
+        try (var input = Files.newInputStream(source, LinkOption.NOFOLLOW_LINKS)) {
+            header = input.readNBytes(3);
+        }
+        if (header.length >= 3 && header[0] == 'I' && header[1] == 'D' && header[2] == '3') {
+            return true;
+        }
+        return header.length >= 2
+                && (header[0] & 0xff) == 0xff
+                && (header[1] & 0xe0) == 0xe0;
+    }
+
+    private static String normalizeMusicId(String value, String fileName, String hash) {
+        String raw = value == null || value.isBlank()
+                ? fileName.substring(0, fileName.length() - 4) : value.trim();
+        String normalized = raw.toLowerCase(Locale.ROOT)
+                .replaceAll("[^a-z0-9._-]+", "-")
+                .replaceAll("^-+|-+$", "");
+        if (!normalized.matches("[a-z0-9][a-z0-9._-]{0,63}")) {
+            normalized = "track-" + hash.substring(0, 8);
+        }
+        return normalized;
+    }
+
+    private static String requiredMusicId(String value) {
+        if (value == null || value.isBlank()) {
+            throw new ManagementException("Music track ID cannot be empty");
+        }
+        String normalized = value.trim().toLowerCase(Locale.ROOT);
+        if (!normalized.matches("[a-z0-9][a-z0-9._-]{0,63}")) {
+            throw new ManagementException("Invalid music track ID: " + value);
+        }
+        return normalized;
+    }
+
+    private Path validateSource(Path sourceDirectory) {
+        if (sourceDirectory == null) {
+            throw new ManagementException("A standard modpack source directory is required");
+        }
+        Path source = sourceDirectory.toAbsolutePath().normalize();
+        try { PathSafety.assertSafePathTree(source); }
+        catch (IOException | cn.dreamingfish.updater.protocol.ProtocolException unsafe) {
+            throw new ManagementException("Standard modpack source path traverses a directory alias", unsafe);
+        }
+        if (!Files.isDirectory(source)) {
+            throw new ManagementException("Standard modpack source directory does not exist: " + source);
+        }
+        if (Files.isSymbolicLink(source)) {
+            throw new ManagementException("Standard modpack source directory cannot be a symbolic link: " + source);
+        }
+        if (source.startsWith(paths.root()) || paths.root().startsWith(source)) {
+            throw new ManagementException("The standard modpack source and management data directories must be separate");
+        }
+        return source;
+    }
+
+    private static void validateProjectId(String id) {
+        if (id == null || !id.matches("[a-z0-9][a-z0-9._-]{0,63}")) {
+            throw new ManagementException("Project ID must use lowercase letters, digits, dots, underscores, or hyphens");
+        }
+    }
+
+    private static String normalizeDisplayName(String value) {
+        if (value == null || value.isBlank()) {
+            throw new ManagementException("Project display name cannot be empty");
+        }
+        String normalized = value.trim();
+        if (normalized.length() > 120
+                || normalized.chars().anyMatch(Character::isISOControl)) {
+            throw new ManagementException("Project display name is too long or contains control characters");
+        }
+        return normalized;
+    }
+
+    /**
+     * The update address may stay empty while the pack is prepared. Players only learn it from a
+     * deployment package, so it is required before publishing or delivering.
+     */
+    public static void requirePublicBaseUrl(ProjectRecord project, String purpose) {
+        if (project.publicBaseUrl().isBlank()) {
+            throw new ManagementException("还没有填写玩家更新地址。" + purpose
+                    + "前，请先在项目设置里填写玩家电脑能访问的地址，例如 http://你的域名或公网IP:端口");
+        }
+    }
+
+    private static void validateBinding(ProjectRecord project) {
+        // An address chosen later is validated when it is set; the rest of the binding must be valid now.
+        String url = project.publicBaseUrl().isBlank() ? "http://127.0.0.1" : project.publicBaseUrl();
+        ManifestValidator.validateBinding(new ProjectBinding(ProtocolConstants.BINDING_SCHEMA_VERSION,
+                project.id(), url, project.publicKey(), "DreamingFishUpdater", null, project.branding()));
+    }
+
+    static String normalizeOptionalBaseUrl(String input) {
+        return input == null || input.isBlank() ? "" : normalizeBaseUrl(input.trim());
+    }
+
+    static String normalizeBaseUrl(String input) {
+        try {
+            URI uri = new URI(input);
+            String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(Locale.ROOT);
+            if (!(scheme.equals("http") || scheme.equals("https")) || uri.getHost() == null
+                    || uri.getUserInfo() != null || uri.getQuery() != null || uri.getFragment() != null) {
+                throw new ManagementException("玩家更新地址必须是以 http:// 或 https:// 开头的完整地址，"
+                        + "不能带用户名、问号参数或 #，例如 http://你的域名或公网IP:端口");
+            }
+            String value = uri.toString();
+            while (value.endsWith("/")) {
+                value = value.substring(0, value.length() - 1);
+            }
+            return value;
+        } catch (URISyntaxException | NullPointerException e) {
+            throw new ManagementException("玩家更新地址格式不正确：" + input, e);
+        }
+    }
+}

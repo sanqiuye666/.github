@@ -1,0 +1,32 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import {createHash} from 'node:crypto';
+
+/** 真实原生IPC/官方目录与主动动画预览；不替换任何服务响应。 */
+export async function checkAutoCottage({app,preset,screenshot,helper,write,checks,out}){
+ const page=app.page;
+ helper(['--pid',String(app.child.pid),'--started-at',app.ownership.processStartedAt,'--title','三秋叶启动器','--action','resize','--width','1476','--height','850']);
+ await page.locator('[data-launcher-page="mods"]').click();await page.locator('[data-mod-project]').first().waitFor({timeout:60000});
+ assert.equal(app.sent.filter(c=>c.path.startsWith('/mods/search?')).length,1);await screenshot(app,'mods-auto-enter');checks.push('native-mods-auto-first-list-without-clicking-search');
+ await page.locator('[data-mod-source="CURSEFORGE"]').click();assert.equal(await page.locator('[data-search-mods]').isDisabled(),true);assert.ok(!app.sent.some(c=>c.path.startsWith('/mods/search?')&&c.path.includes('CURSEFORGE')));checks.push('native-unconfigured-source-not-queried');
+ await page.locator('[data-mod-source="MODRINTH"]').click();await page.locator('[data-mod-project]').first().waitFor({timeout:60000});assert.equal(app.sent.filter(c=>c.path.startsWith('/mods/search?')).length,2);checks.push('native-return-to-source-auto-loads');
+ await page.locator('[data-launcher-page="packs"]').click();await page.locator('[data-pack-project]').first().waitFor({timeout:60000});assert.equal(app.sent.filter(c=>c.path.startsWith('/packs/search?')).length,1);await screenshot(app,'packs-auto-enter');checks.push('native-packs-auto-first-list-without-clicking-search');
+ for(const name of ['simple','cards','immersive','workbench'])await preset(app,name);assert.equal(app.sent.filter(c=>c.path.startsWith('/packs/search?')).length,1);checks.push('native-four-presets-without-redundant-directory-query');
+ const before=await page.evaluate(()=>localStorage.getItem('sqy.launcher.workspace.v1'));
+ await page.locator('[data-workspace-settings]').click();await page.locator('[data-preview-cottage]').click();const dialog=page.getByRole('dialog',{name:'枫叶小屋独立演示',exact:true});await dialog.waitFor();
+ await page.waitForFunction(()=>!!document.querySelector('.cottage-walker canvas')?.getContext('webgl2'),null,{timeout:20000});
+ assert.equal(await dialog.getByRole('alert').count(),0);assert.equal(await page.locator('[data-cottage-stage]').getAttribute('data-phase'),'loading');await screenshot(app,'cottage-loading');checks.push('native-cottage-transparent-scene-real-webgl');
+ const leaves=()=>page.locator('.cottage-scene use').evaluateAll(items=>items.map(i=>i.parentElement.getAttribute('transform')));
+ await page.locator('[data-cottage-ready]').click();await page.waitForTimeout(100);const frozen=await leaves();await page.waitForTimeout(900);assert.deepEqual(await leaves(),frozen);await screenshot(app,'cottage-walking');
+ await page.waitForFunction(()=>document.querySelector('[data-cottage-stage]')?.getAttribute('data-phase')==='entered',null,{timeout:8000});checks.push('native-ready-stops-leaves-walks-home-and-finishes');
+ const skin=Buffer.from(await page.evaluate(()=>{const c=document.createElement('canvas');c.width=c.height=64;const g=c.getContext('2d');g.fillStyle='#c99571';g.fillRect(0,0,32,16);g.fillStyle='#285e94';g.fillRect(16,16,24,16);g.fillRect(40,16,16,16);g.fillRect(32,48,16,16);g.fillStyle='#263546';g.fillRect(0,16,16,16);g.fillRect(16,48,16,16);return c.toDataURL('image/png').split(',')[1];}),'base64');
+ const skinPath=path.join(out,'native-preview-skin.png');fs.writeFileSync(skinPath,skin);await dialog.locator('input[type=file]').setInputFiles(skinPath);await dialog.getByText('本机皮肤 · native-preview-skin.png',{exact:false}).waitFor();assert.equal(await page.locator('[data-cottage-stage]').getAttribute('data-phase'),'loading');
+ await page.locator('[data-cottage-ready]').click();await page.waitForTimeout(1900);await screenshot(app,'cottage-local-skin-walking');checks.push('native-local-png-skin-read-and-walk-no-account-upload');write('skin-source.json',{sha256:createHash('sha256').update(skin).digest('hex'),afterSha256:createHash('sha256').update(fs.readFileSync(skinPath)).digest('hex'),accountUpload:false});
+ await page.locator('[data-cottage-replay]').click();await dialog.getByRole('switch',{name:'显示透明网格',exact:true}).check();await dialog.getByRole('switch',{name:'减少动态',exact:true}).check();await page.locator('[data-cottage-ready]').click();assert.equal(await page.locator('[data-cottage-stage]').getAttribute('data-phase'),'entered');await screenshot(app,'cottage-reduced-transparency');checks.push('native-reduced-motion-immediate-completion-and-checker');
+ write('cottage-keyboard-before.json',await page.evaluate(()=>({active:document.activeElement?.outerHTML.slice(0,500),focused:document.hasFocus()})));
+ await page.keyboard.press('Escape');write('cottage-keyboard-after.json',await page.evaluate(()=>({active:document.activeElement?.outerHTML.slice(0,500),open:!!document.querySelector('.cottage-preview')})));await dialog.waitFor({state:'detached'});await page.getByRole('dialog',{name:'工作台外观',exact:true}).waitFor();assert.equal(await page.evaluate(()=>localStorage.getItem('sqy.launcher.workspace.v1')),before);checks.push('native-preview-close-restores-appearance-and-preserves-intro');
+ await page.keyboard.press('Escape');helper(['--pid',String(app.child.pid),'--started-at',app.ownership.processStartedAt,'--title','三秋叶启动器','--action','resize','--width','1000','--height','700']);
+ await page.locator('[data-workspace-settings]').click();await page.locator('[data-preview-cottage]').click();await dialog.waitFor();const overflow=await dialog.evaluate(el=>el.scrollWidth>el.clientWidth+2);assert.equal(overflow,false);await screenshot(app,'cottage-narrow');const narrowMotion=dialog.getByRole('switch',{name:'减少动态',exact:true});await narrowMotion.check();assert.equal(await narrowMotion.evaluate(el=>{const r=el.getBoundingClientRect();return r.top>=0&&r.bottom<=innerHeight;}),true);await screenshot(app,'cottage-narrow-controls');await page.locator('[data-cottage-ready]').click();assert.equal(await page.locator('[data-cottage-stage]').getAttribute('data-phase'),'entered');checks.push('native-narrow-controls-scroll-reachable');await page.keyboard.press('Escape');await page.keyboard.press('Escape');checks.push('native-cottage-narrow-and-keyboard-close');
+ write('auto-cottage-calls.json',app.calls);write('auto-cottage-sent.json',app.sent);
+}

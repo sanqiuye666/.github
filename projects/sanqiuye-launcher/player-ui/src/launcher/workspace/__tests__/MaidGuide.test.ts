@@ -1,0 +1,4 @@
+import {createApp,nextTick} from 'vue';
+import {it,expect,vi} from 'vitest';
+import MaidGuide from '../MaidGuide.vue';
+it('角色说明在图片失败或收起时可读，按钮能重开',async()=>{const root=document.createElement('div'),toggle=vi.fn();const app=createApp(MaidGuide,{state:'attention',message:'请先检查 Java。',collapsed:false,onToggle:toggle});app.mount(root);expect(root.textContent).toContain('请先检查 Java');root.querySelector('img')?.dispatchEvent(new Event('error'));await nextTick();expect(root.textContent).toContain('请先检查 Java');root.querySelector('button')!.click();expect(toggle).toHaveBeenCalledOnce();app.unmount();const compact=createApp(MaidGuide,{state:'guide',message:'使用指引',collapsed:true,onToggle:toggle});compact.mount(root);expect(root.querySelector('button')?.textContent).toContain('展开');compact.unmount();});

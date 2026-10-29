@@ -1,0 +1,3 @@
+package cn.dreamingfish.launcher.mods;
+import java.util.Objects;
+public record ModProject(ModSource source,String projectId,String title,String author,String summary,Long downloads,cn.dreamingfish.launcher.content.ProjectPresentation presentation){public ModProject(ModSource source,String projectId,String title,String author,String summary,Long downloads){this(source,projectId,title,author,summary,downloads,cn.dreamingfish.launcher.content.ProjectPresentation.empty());}public ModProject{Objects.requireNonNull(presentation);Objects.requireNonNull(source);ModProtocol.id(projectId);if(downloads!=null&&downloads<0)throw new IllegalArgumentException("下载数量无效");}}

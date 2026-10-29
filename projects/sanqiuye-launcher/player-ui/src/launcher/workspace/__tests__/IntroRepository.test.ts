@@ -1,0 +1,2 @@
+import {afterEach,expect,it,vi} from 'vitest';import {animationRepository} from '../intro/repository';afterEach(()=>vi.unstubAllGlobals());
+it('存储被阻塞并返回失败后，迟到连接应立即关闭',async()=>{const close=vi.fn();const request:any={result:{close},transaction:{abort:vi.fn()}};vi.stubGlobal('indexedDB',{open:()=>request});const pending=animationRepository.read();request.onblocked(new Event('blocked'));await expect(pending).rejects.toThrow('占用');request.onsuccess(new Event('success'));expect(close).toHaveBeenCalledOnce();});

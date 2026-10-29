@@ -1,0 +1,623 @@
+package cn.dreamingfish.updater.management;
+
+import cn.dreamingfish.updater.protocol.Branding;
+import cn.dreamingfish.updater.protocol.JsonCodec;
+import cn.dreamingfish.updater.protocol.ManifestFile;
+import cn.dreamingfish.updater.protocol.ReleaseManifest;
+import cn.dreamingfish.updater.protocol.PlayerMusicTrack;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+
+public final class ManagementDatabase {
+    private static final String SCHEMA = """
+            CREATE TABLE IF NOT EXISTS projects (
+                id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                public_base_url TEXT NOT NULL,
+                public_key TEXT NOT NULL,
+                private_key_file TEXT NOT NULL,
+                branding_json TEXT NOT NULL,
+                rules_json TEXT NOT NULL,
+                next_sequence INTEGER NOT NULL CHECK (next_sequence > 0),
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS releases (
+                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+                release_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence > 0),
+                display_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                changelog TEXT NOT NULL,
+                manifest_sha256 TEXT NOT NULL,
+                signature TEXT NOT NULL,
+                manifest_path TEXT NOT NULL,
+                PRIMARY KEY (project_id, release_id),
+                UNIQUE (project_id, sequence)
+            );
+
+            CREATE TABLE IF NOT EXISTS release_files (
+                project_id TEXT NOT NULL,
+                release_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                size INTEGER NOT NULL CHECK (size >= 0),
+                policy TEXT NOT NULL,
+                executable INTEGER NOT NULL CHECK (executable IN (0, 1)),
+                PRIMARY KEY (project_id, release_id, path),
+                FOREIGN KEY (project_id, release_id)
+                    REFERENCES releases(project_id, release_id) ON DELETE RESTRICT
+            );
+
+            CREATE TABLE IF NOT EXISTS objects (
+                sha256 TEXT PRIMARY KEY,
+                size INTEGER NOT NULL CHECK (size >= 0),
+                reference_count INTEGER NOT NULL CHECK (reference_count >= 0),
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_releases_latest
+                ON releases(project_id, sequence DESC);
+            CREATE INDEX IF NOT EXISTS idx_release_files_hash
+                ON release_files(sha256);
+
+            CREATE TABLE IF NOT EXISTS project_settings_operations (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+                created_at TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                before_json TEXT NOT NULL,
+                after_json TEXT NOT NULL,
+                undone INTEGER NOT NULL DEFAULT 0 CHECK (undone IN (0, 1))
+            );
+            CREATE INDEX IF NOT EXISTS idx_settings_operations_project
+                ON project_settings_operations(project_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS release_maintenance_settings (
+                project_id TEXT NOT NULL,
+                release_id TEXT NOT NULL,
+                rules_json TEXT NOT NULL,
+                PRIMARY KEY (project_id, release_id),
+                FOREIGN KEY (project_id, release_id) REFERENCES releases(project_id, release_id) ON DELETE RESTRICT
+            );
+            """;
+
+    private final ManagementPaths paths;
+    private final JsonCodec json;
+
+    public ManagementDatabase(ManagementPaths paths, JsonCodec json) {
+        this.paths = paths;
+        this.json = json;
+    }
+
+    public void initialize() {
+        try (InstanceAccess access=InstanceAccess.acquire(paths.root(),false)) {
+            paths.initialize();
+            try (Connection connection = open(); Statement statement = connection.createStatement()) {
+                for (String sql : SCHEMA.split(";")) {
+                    if (!sql.isBlank()) {
+                        statement.execute(sql);
+                    }
+                }
+            }
+            migrateLegacyDefaultRules();
+        } catch (IOException | SQLException e) {
+            throw new ManagementException("Unable to initialize management storage", e);
+        }
+    }
+
+    private void migrateLegacyDefaultRules() throws SQLException {
+        String select = "SELECT id, rules_json FROM projects";
+        String update = "UPDATE projects SET rules_json = ? WHERE id = ?";
+        try (Connection connection = open()) {
+            connection.setAutoCommit(false);
+            try {
+                List<RulesMigration> migrations = new ArrayList<>();
+                try (PreparedStatement statement = connection.prepareStatement(select);
+                     ResultSet result = statement.executeQuery()) {
+                    while (result.next()) {
+                        String stored = result.getString("rules_json");
+                        if (!stored.contains("\"DEFAULT\"")) continue;
+                        ProjectRules rules = json.read(
+                                stored.getBytes(StandardCharsets.UTF_8), ProjectRules.class);
+                        String normalized = json.writeString(rules);
+                        if (!stored.equals(normalized)) {
+                            migrations.add(new RulesMigration(
+                                    result.getString("id"), normalized));
+                        }
+                    }
+                }
+                if (!migrations.isEmpty()) {
+                    try (PreparedStatement statement = connection.prepareStatement(update)) {
+                        for (RulesMigration migration : migrations) {
+                            statement.setString(1, migration.rulesJson());
+                            statement.setString(2, migration.projectId());
+                            statement.addBatch();
+                        }
+                        statement.executeBatch();
+                    }
+                }
+                connection.commit();
+            } catch (RuntimeException | SQLException e) {
+                connection.rollback();
+                throw e;
+            } finally {
+                connection.setAutoCommit(true);
+            }
+        }
+    }
+
+    public void insertProject(ProjectRecord project) {
+        String sql = """
+                INSERT INTO projects (
+                    id, display_name, source_path, public_base_url, public_key, private_key_file,
+                    branding_json, rules_json, next_sequence, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """;
+        try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, project.id());
+            statement.setString(2, project.displayName());
+            statement.setString(3, project.sourceDirectory().toAbsolutePath().normalize().toString());
+            statement.setString(4, project.publicBaseUrl());
+            statement.setString(5, project.publicKey());
+            statement.setString(6, toStoredPath(project.privateKeyFile()));
+            statement.setString(7, json.writeString(project.branding()));
+            statement.setString(8, json.writeString(project.rules()));
+            statement.setLong(9, project.nextSequence());
+            statement.setString(10, project.createdAt().toString());
+            statement.executeUpdate();
+        } catch (SQLException e) {
+            throw new ManagementException("Unable to create project " + project.id(), e);
+        }
+    }
+
+    public Optional<ProjectRecord> findProject(String projectId) {
+        String sql = "SELECT * FROM projects WHERE id = ?";
+        try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, projectId);
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next() ? Optional.of(readProject(result)) : Optional.empty();
+            }
+        } catch (SQLException e) {
+            throw new ManagementException("Unable to read project " + projectId, e);
+        }
+    }
+
+    public ProjectRecord requireProject(String projectId) {
+        new SourceImportRecovery(paths,this,json).recoverPending(projectId);
+        return findProject(projectId)
+                .orElseThrow(() -> new ManagementException("Unknown project: " + projectId));
+    }
+
+    public List<ProjectRecord> listProjects() {
+        String sql = "SELECT * FROM projects ORDER BY id";
+        try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(sql);
+             ResultSet result = statement.executeQuery()) {
+            List<ProjectRecord> projects = new ArrayList<>();
+            while (result.next()) {
+                projects.add(readProject(result));
+            }
+            return List.copyOf(projects);
+        } catch (SQLException e) {
+            throw new ManagementException("Unable to list projects", e);
+        }
+    }
+
+    public void updateProject(String projectId, String displayName, Path source,
+                              String publicBaseUrl, Branding branding, ProjectRules rules) {
+        try (ProjectLock ignored = ProjectLock.acquire(paths.locks().resolve(projectId+".lock"))) {
+            requireProject(projectId);
+            updateProject(projectId, displayName, source, publicBaseUrl, branding, rules, true);
+        } catch (IOException error) { throw new ManagementException("无法锁定项目设置",error); }
+    }
+
+    void updateProjectWithoutJournal(String projectId, String displayName, Path source,
+                                     String publicBaseUrl, Branding branding, ProjectRules rules) {
+        updateProject(projectId, displayName, source, publicBaseUrl, branding, rules, false);
+    }
+
+    private void updateProject(String projectId, String displayName, Path source,
+                               String publicBaseUrl, Branding branding, ProjectRules rules, boolean journal) {
+        try (Connection connection = open()) {
+            connection.setAutoCommit(false);
+            try {
+                ProjectSettingsSnapshot before = settings(connection, projectId);
+                ProjectSettingsSnapshot after = new ProjectSettingsSnapshot(displayName,
+                        source.toAbsolutePath().normalize().toString(), publicBaseUrl, branding, rules);
+                writeSettings(connection, projectId, after);
+                if (journal) appendSettingsOperation(connection, projectId, before, after, "EDIT");
+                connection.commit();
+            } catch (Exception e) {
+                connection.rollback();
+                if (e instanceof ManagementException known) throw known;
+                throw new ManagementException("Unable to update project " + projectId, e);
+            }
+        } catch (SQLException e) {
+            throw new ManagementException("Unable to update project " + projectId, e);
+        }
+    }
+
+    private ProjectSettingsSnapshot settings(Connection connection, String projectId) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement("SELECT * FROM projects WHERE id = ?")) {
+            statement.setString(1, projectId);
+            try (ResultSet result = statement.executeQuery()) {
+                if (!result.next()) throw new ManagementException("Unknown project: " + projectId);
+                return ProjectSettingsSnapshot.of(readProject(result));
+            }
+        }
+    }
+
+    private void writeSettings(Connection connection, String projectId, ProjectSettingsSnapshot settings) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement("UPDATE projects SET display_name=?, source_path=?, public_base_url=?, branding_json=?, rules_json=? WHERE id=?")) {
+            statement.setString(1, settings.displayName()); statement.setString(2, settings.sourceDirectory());
+            statement.setString(3, settings.publicBaseUrl()); statement.setString(4, json.writeString(settings.branding()));
+            statement.setString(5, json.writeString(settings.rules())); statement.setString(6, projectId);
+            if (statement.executeUpdate() != 1) throw new ManagementException("Unknown project: " + projectId);
+        }
+    }
+
+    private void appendSettingsOperation(Connection connection, String projectId, ProjectSettingsSnapshot before,
+                                          ProjectSettingsSnapshot after, String kind) throws SQLException {
+        if (before.equals(after) || before.changesTo(after).isEmpty()) return;
+        try (PreparedStatement statement = connection.prepareStatement("INSERT INTO project_settings_operations(id,project_id,created_at,kind,before_json,after_json) VALUES(?,?,?,?,?,?)")) {
+            statement.setString(1, java.util.UUID.randomUUID().toString()); statement.setString(2, projectId);
+            statement.setString(3, Instant.now().toString()); statement.setString(4, kind);
+            statement.setString(5, json.writeString(before)); statement.setString(6, json.writeString(after));
+            statement.executeUpdate();
+        }
+    }
+
+    public List<SettingsOperation> settingsOperations(String projectId) {
+        requireProject(projectId);
+        try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(
+                "SELECT * FROM project_settings_operations WHERE project_id=? ORDER BY created_at DESC, id DESC LIMIT 200")) {
+            statement.setString(1, projectId);
+            try (ResultSet result = statement.executeQuery()) {
+                List<SettingsOperation> entries = new ArrayList<>();
+                while (result.next()) entries.add(readSettingsOperation(result));
+                return List.copyOf(entries);
+            }
+        } catch (SQLException e) { throw new ManagementException("Unable to read operation history", e); }
+    }
+
+    public SettingsOperation settingsOperation(String projectId, String operationId) {
+        try (Connection connection = open()) { return settingsOperation(connection, projectId, operationId); }
+        catch (SQLException e) { throw new ManagementException("Unable to read operation", e); }
+    }
+
+    private SettingsOperation settingsOperation(Connection connection, String projectId, String id) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement("SELECT * FROM project_settings_operations WHERE project_id=? AND id=?")) {
+            statement.setString(1, projectId); statement.setString(2, id);
+            try (ResultSet result = statement.executeQuery()) {
+                if (!result.next()) throw new ManagementException("这条操作记录不存在");
+                return readSettingsOperation(result);
+            }
+        }
+    }
+
+    private SettingsOperation readSettingsOperation(ResultSet result) throws SQLException {
+        return new SettingsOperation(result.getString("id"), result.getString("project_id"),
+                Instant.parse(result.getString("created_at")), result.getString("kind"),
+                json.read(result.getString("before_json").getBytes(StandardCharsets.UTF_8), ProjectSettingsSnapshot.class),
+                json.read(result.getString("after_json").getBytes(StandardCharsets.UTF_8), ProjectSettingsSnapshot.class), result.getInt("undone") == 1);
+    }
+
+    public ProjectRecord undoSettingsOperation(String projectId, String id, ProjectSettingsSnapshot expected) {
+        try (Connection connection = open()) {
+            connection.setAutoCommit(false);
+            try {
+                SettingsOperation entry = settingsOperation(connection, projectId, id);
+                ProjectSettingsSnapshot current = settings(connection, projectId);
+                if (entry.undone()) { connection.rollback(); return requireProject(projectId); }
+                if (!current.equals(expected)) throw new ManagementException("设置已改变，请重新查看撤销预览");
+                ProjectSettingsSnapshot restored = ProjectSettingsSnapshot.revert(current, entry.before(), entry.after());
+                writeSettings(connection, projectId, restored);
+                try (PreparedStatement statement = connection.prepareStatement("UPDATE project_settings_operations SET undone=1 WHERE project_id=? AND id=?")) {
+                    statement.setString(1, projectId); statement.setString(2, id); statement.executeUpdate();
+                }
+                appendSettingsOperation(connection, projectId, current, restored, "UNDO");
+                connection.commit();
+            } catch (Exception e) {
+                connection.rollback();
+                if (e instanceof ManagementException known) throw known;
+                throw new ManagementException("Unable to undo project settings", e);
+            }
+            return requireProject(projectId);
+        } catch (SQLException e) { throw new ManagementException("Unable to undo project settings", e); }
+    }
+
+    public Optional<ProjectRules> releaseSettings(String projectId, String releaseId) {
+        try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(
+                "SELECT rules_json FROM release_maintenance_settings WHERE project_id=? AND release_id=?")) {
+            statement.setString(1, projectId); statement.setString(2, releaseId);
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next() ? Optional.of(json.read(result.getString(1).getBytes(StandardCharsets.UTF_8), ProjectRules.class)) : Optional.empty();
+            }
+        } catch (SQLException e) { throw new ManagementException("Unable to read published maintenance settings", e); }
+    }
+
+    public void restoreMaintenance(String projectId, String releaseId, ProjectRules rules, ProjectSettingsSnapshot expected) {
+        try (Connection connection = open()) {
+            connection.setAutoCommit(false);
+            try {
+                ProjectSettingsSnapshot current = settings(connection, projectId);
+                if (!current.equals(expected)) throw new ManagementException("设置已改变，请重新查看恢复预览");
+                try (PreparedStatement latest = connection.prepareStatement("SELECT release_id FROM releases WHERE project_id=? ORDER BY sequence DESC LIMIT 1")) {
+                    latest.setString(1, projectId);
+                    try (ResultSet result = latest.executeQuery()) {
+                        if (!result.next() || !releaseId.equals(result.getString(1))) {
+                            throw new ManagementException("已发布版本发生变化，请重新查看恢复预览");
+                        }
+                    }
+                }
+                ProjectSettingsSnapshot after = new ProjectSettingsSnapshot(current.displayName(), current.sourceDirectory(),
+                        current.publicBaseUrl(), current.branding(), rules);
+                writeSettings(connection, projectId, after);
+                appendSettingsOperation(connection, projectId, current, after, "RESTORE");
+                connection.commit();
+            } catch (Exception e) {
+                connection.rollback();
+                if (e instanceof ManagementException known) throw known;
+                throw new ManagementException("Unable to restore maintenance settings", e);
+            }
+        } catch (SQLException e) { throw new ManagementException("Unable to restore maintenance settings", e); }
+    }
+
+    public Optional<StoredRelease> latestRelease(String projectId) {
+        String sql = """
+                SELECT * FROM releases
+                WHERE project_id = ?
+                ORDER BY sequence DESC
+                LIMIT 1
+                """;
+        return queryRelease(sql, projectId, null);
+    }
+
+    public Optional<StoredRelease> findRelease(String projectId, String releaseId) {
+        String sql = "SELECT * FROM releases WHERE project_id = ? AND release_id = ?";
+        return queryRelease(sql, projectId, releaseId);
+    }
+
+    public List<StoredRelease> listReleases(String projectId) {
+        String sql = "SELECT * FROM releases WHERE project_id = ? ORDER BY sequence DESC";
+        try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, projectId);
+            try (ResultSet result = statement.executeQuery()) {
+                List<StoredRelease> releases = new ArrayList<>();
+                while (result.next()) {
+                    releases.add(readRelease(result));
+                }
+                return List.copyOf(releases);
+            }
+        } catch (SQLException e) {
+            throw new ManagementException("Unable to list releases for " + projectId, e);
+        }
+    }
+
+    public ReleaseManifest readManifest(StoredRelease release) {
+        try {
+            return json.read(release.manifestPath(), ReleaseManifest.class);
+        } catch (IOException e) {
+            throw new ManagementException("Unable to read manifest " + release.manifestPath(), e);
+        }
+    }
+
+    public void commitRelease(ReleaseManifest manifest, String signature, String manifestSha256,
+                              Path manifestPath) {
+        commitRelease(manifest, signature, manifestSha256, manifestPath, null);
+    }
+
+    public void commitRelease(ReleaseManifest manifest, String signature, String manifestSha256,
+                              Path manifestPath, ProjectRules publishedRules) {
+        String insertRelease = """
+                INSERT INTO releases (
+                    project_id, release_id, sequence, display_version, created_at, changelog,
+                    manifest_sha256, signature, manifest_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """;
+        String insertFile = """
+                INSERT INTO release_files (
+                    project_id, release_id, path, sha256, size, policy, executable
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """;
+        String upsertObject = """
+                INSERT INTO objects (sha256, size, reference_count, created_at)
+                VALUES (?, ?, 1, ?)
+                ON CONFLICT(sha256) DO UPDATE SET
+                    reference_count = objects.reference_count + 1
+                """;
+        String advanceProject = """
+                UPDATE projects SET next_sequence = ?
+                WHERE id = ? AND next_sequence = ?
+                """;
+
+        try (Connection connection = open()) {
+            connection.setAutoCommit(false);
+            try (PreparedStatement releaseStatement = connection.prepareStatement(insertRelease);
+                 PreparedStatement fileStatement = connection.prepareStatement(insertFile);
+                 PreparedStatement objectStatement = connection.prepareStatement(upsertObject);
+                 PreparedStatement advanceStatement = connection.prepareStatement(advanceProject)) {
+                releaseStatement.setString(1, manifest.projectId());
+                releaseStatement.setString(2, manifest.releaseId());
+                releaseStatement.setLong(3, manifest.sequence());
+                releaseStatement.setString(4, manifest.displayVersion());
+                releaseStatement.setString(5, manifest.createdAt().toString());
+                releaseStatement.setString(6, manifest.changelog());
+                releaseStatement.setString(7, manifestSha256);
+                releaseStatement.setString(8, signature);
+                releaseStatement.setString(9, toStoredPath(manifestPath));
+                releaseStatement.executeUpdate();
+
+                for (ManifestFile file : manifest.files()) {
+                    fileStatement.setString(1, manifest.projectId());
+                    fileStatement.setString(2, manifest.releaseId());
+                    fileStatement.setString(3, file.path());
+                    fileStatement.setString(4, file.sha256());
+                    fileStatement.setLong(5, file.size());
+                    fileStatement.setString(6, file.policy().name());
+                    fileStatement.setInt(7, file.executable() ? 1 : 0);
+                    fileStatement.addBatch();
+
+                    objectStatement.setString(1, file.sha256());
+                    objectStatement.setLong(2, file.size());
+                    objectStatement.setString(3, manifest.createdAt().toString());
+                    objectStatement.addBatch();
+                }
+                if (manifest.branding().musicTracks() != null) {
+                    for (PlayerMusicTrack track : manifest.branding().musicTracks()) {
+                        objectStatement.setString(1, track.sha256());
+                        objectStatement.setLong(2, track.size());
+                        objectStatement.setString(3, manifest.createdAt().toString());
+                        objectStatement.addBatch();
+                    }
+                }
+                fileStatement.executeBatch();
+                objectStatement.executeBatch();
+
+                advanceStatement.setLong(1, manifest.sequence() + 1);
+                advanceStatement.setString(2, manifest.projectId());
+                advanceStatement.setLong(3, manifest.sequence());
+                if (advanceStatement.executeUpdate() != 1) {
+                    throw new ManagementException("Project changed while the release was being committed");
+                }
+                if (publishedRules != null) {
+                    try (PreparedStatement snapshot = connection.prepareStatement(
+                            "INSERT INTO release_maintenance_settings(project_id,release_id,rules_json) VALUES(?,?,?)")) {
+                        snapshot.setString(1, manifest.projectId()); snapshot.setString(2, manifest.releaseId());
+                        snapshot.setString(3, json.writeString(publishedRules)); snapshot.executeUpdate();
+                    }
+                    try (PreparedStatement statement = connection.prepareStatement(
+                            "UPDATE projects SET rules_json = ? WHERE id = ?")) {
+                        statement.setString(1, new String(json.writePretty(publishedRules), StandardCharsets.UTF_8));
+                        statement.setString(2, manifest.projectId());
+                        statement.executeUpdate();
+                    }
+                }
+                connection.commit();
+            } catch (Exception e) {
+                connection.rollback();
+                if (e instanceof ManagementException managementException) {
+                    throw managementException;
+                }
+                throw new ManagementException("Unable to commit release " + manifest.releaseId(), e);
+            } finally {
+                connection.setAutoCommit(true);
+            }
+        } catch (SQLException e) {
+            throw new ManagementException("Unable to commit release " + manifest.releaseId(), e);
+        }
+    }
+
+    public void createConsistentSnapshot(Path target) {
+        try {
+            java.nio.file.Files.deleteIfExists(target);
+            String escaped = target.toAbsolutePath().normalize().toString().replace("'", "''");
+            try (Connection connection = open(); Statement statement = connection.createStatement()) {
+                statement.execute("VACUUM INTO '" + escaped + "'");
+            }
+        } catch (IOException | SQLException e) {
+            throw new ManagementException("Unable to create a consistent database snapshot", e);
+        }
+    }
+
+    private Optional<StoredRelease> queryRelease(String sql, String projectId, String releaseId) {
+        try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, projectId);
+            if (releaseId != null) {
+                statement.setString(2, releaseId);
+            }
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next() ? Optional.of(readRelease(result)) : Optional.empty();
+            }
+        } catch (SQLException e) {
+            throw new ManagementException("Unable to read release", e);
+        }
+    }
+
+    private ProjectRecord readProject(ResultSet result) throws SQLException {
+        Branding branding = json.read(
+                result.getString("branding_json").getBytes(StandardCharsets.UTF_8), Branding.class);
+        ProjectRules rules = json.read(
+                result.getString("rules_json").getBytes(StandardCharsets.UTF_8), ProjectRules.class);
+        return new ProjectRecord(
+                result.getString("id"),
+                result.getString("display_name"),
+                Path.of(result.getString("source_path")),
+                result.getString("public_base_url"),
+                result.getString("public_key"),
+                fromStoredPath(result.getString("private_key_file")),
+                branding,
+                rules,
+                result.getLong("next_sequence"),
+                Instant.parse(result.getString("created_at"))
+        );
+    }
+
+    private StoredRelease readRelease(ResultSet result) throws SQLException {
+        return new StoredRelease(
+                result.getString("project_id"),
+                result.getString("release_id"),
+                result.getLong("sequence"),
+                result.getString("display_version"),
+                Instant.parse(result.getString("created_at")),
+                result.getString("changelog"),
+                result.getString("manifest_sha256"),
+                result.getString("signature"),
+                fromStoredPath(result.getString("manifest_path"))
+        );
+    }
+
+    private Connection open() throws SQLException {
+        final InstanceAccess access;
+        try{access=InstanceAccess.acquire(paths.root(),false);}catch(IOException error){throw new SQLException("Management instance is unavailable",error);}
+        Connection connection=null;
+        try {
+            connection=DriverManager.getConnection("jdbc:sqlite:"+paths.database());
+            try(Statement statement=connection.createStatement()){
+                statement.execute("PRAGMA foreign_keys = ON");statement.execute("PRAGMA busy_timeout = 10000");
+                statement.execute("PRAGMA journal_mode = WAL");statement.execute("PRAGMA synchronous = FULL");
+            }
+            Connection owned=connection;var closed=new java.util.concurrent.atomic.AtomicBoolean();
+            return (Connection)java.lang.reflect.Proxy.newProxyInstance(Connection.class.getClassLoader(),new Class<?>[]{Connection.class},(proxy,method,args)->{
+                if(method.getName().equals("close")&&method.getParameterCount()==0){
+                    if(closed.compareAndSet(false,true)){try{owned.close();}finally{access.close();}}return null;
+                }
+                try{return method.invoke(owned,args);}catch(java.lang.reflect.InvocationTargetException error){throw error.getCause();}
+            });
+        }catch(SQLException|RuntimeException error){
+            if(connection!=null)try{connection.close();}catch(SQLException close){error.addSuppressed(close);}
+            try{access.close();}catch(IOException close){error.addSuppressed(close);}throw error;
+        }
+    }
+
+    private String toStoredPath(Path path) {
+        Path absolute = path.toAbsolutePath().normalize();
+        if (!absolute.startsWith(paths.root())) {
+            throw new ManagementException("Managed data path escapes the data root: " + path);
+        }
+        return paths.root().relativize(absolute).toString().replace('\\', '/');
+    }
+
+    private Path fromStoredPath(String path) {
+        Path resolved = paths.root().resolve(path.replace('/', java.io.File.separatorChar)).normalize();
+        if (!resolved.startsWith(paths.root())) {
+            throw new ManagementException("Stored path escapes the data root: " + path);
+        }
+        return resolved;
+    }
+
+    private record RulesMigration(String projectId, String rulesJson) {
+    }
+}

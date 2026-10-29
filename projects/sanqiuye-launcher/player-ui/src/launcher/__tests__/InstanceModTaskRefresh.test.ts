@@ -1,0 +1,11 @@
+import {afterEach,expect,it,vi} from 'vitest';import {createApp,h,nextTick,ref} from 'vue';
+import InstanceCenter from '../InstanceCenter.vue';import type {LocalLauncherClient} from '../local-api';
+let app:ReturnType<typeof createApp>,root:HTMLDivElement;afterEach(()=>{app?.unmount();root?.remove();});async function settle(){for(let i=0;i<18;i++){await Promise.resolve();await nextTick();}}
+it('提交模组任务只刷新任务列表，终态后才重读模组目录，实例对象刷新不重复读目录',async()=>{
+ const instance={id:'one',name:'世界',gameVersion:'1.20.6',loader:'FABRIC',installation:{fileCount:1,loaderVersion:'0.16.14'},createdAt:'',state:'PREPARED'};const listing=ref({instances:[instance],problems:[]});let state='';
+ const read=vi.fn(async()=>({instanceId:'one',loader:'fabric',entries:[],manualFiles:0,compatible:true,directory:'test'}));const task=()=>({id:'task',kind:'MOD_INSTALL',state,inputs:{instanceId:'one'},downloadedBytes:0,totalBytes:10,completedFiles:0,totalFiles:1});
+ const client={instanceMods:read,tasks:vi.fn(async()=>({tasks:state?[task()]:[],total:state?1:0,problems:[]})),planInstanceMods:vi.fn(async()=>({planId:'plan',instanceId:'one',gameVersion:'1.20.6',loader:'fabric',removal:false,files:[],warnings:[],totalBytes:0,expiresAt:new Date(Date.now()+600000).toISOString()})),applyInstanceMods:vi.fn(async()=>{state='QUEUED';return {task:task()};})} as unknown as LocalLauncherClient;
+ root=document.createElement('div');document.body.append(root);app=createApp({render:()=>h(InstanceCenter,{listing:listing.value as never,client,loading:false,error:'',modsAvailable:true,onRefresh:()=>{listing.value={instances:[{...instance}],problems:[]};}})});app.mount(root);await settle();root.querySelector<HTMLButtonElement>('[data-open-instance-mods]')!.click();await settle();expect(read).toHaveBeenCalledTimes(1);
+ root.querySelector<HTMLButtonElement>('[data-install-fabric-api]')!.click();await settle();root.querySelector<HTMLButtonElement>('[data-preview-instance-mods]')!.click();await settle();root.querySelector<HTMLButtonElement>('[data-confirm-instance-mods]')!.click();await settle();expect(read).toHaveBeenCalledTimes(1);
+ state='COMPLETED';root.querySelector<HTMLButtonElement>('[data-refresh-tasks]')!.click();await settle();expect(read).toHaveBeenCalledTimes(2);
+});

@@ -1,0 +1,595 @@
+package cn.dreamingfish.updater.management.cli;
+
+import cn.dreamingfish.updater.management.ManagementDatabase;
+import cn.dreamingfish.updater.management.ManagementPaths;
+import cn.dreamingfish.updater.protocol.JsonCodec;
+import cn.dreamingfish.updater.protocol.ProjectBinding;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.io.PrintWriter;
+import java.io.StringReader;
+import java.io.StringWriter;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+class ManagementCliTest {
+    @TempDir
+    Path temporary;
+
+    @Test
+    void exposesHelpAndCompletesThePublishWorkflow() throws Exception {
+        Invocation version = invoke("--version");
+        assertEquals(0, version.exitCode());
+        assertTrue(version.out().contains("0.2.7"));
+
+        Invocation help = invoke("--help");
+        assertEquals(0, help.exitCode());
+        assertTrue(help.out().contains("project"));
+        assertTrue(help.out().contains("player"));
+        assertTrue(help.out().contains("backup"));
+
+        Path data = temporary.resolve("data");
+        Path source = Files.createDirectories(temporary.resolve("source"));
+        Files.createDirectories(source.resolve("mods"));
+        Files.writeString(source.resolve("mods/example.jar"), "cli-content");
+        Path cover = temporary.resolve("cover.png");
+        Files.writeString(cover, "desktop-cover");
+
+        assertEquals(0, invoke("--data", data.toString(), "init").exitCode());
+        Invocation create = invoke(
+                "--data", data.toString(), "project", "create", "demo",
+                "--name", "Demo Pack",
+                "--source", source.toString(),
+                "--public-url", "http://127.0.0.1:18080",
+                "--force-sync-directories", "mods",
+                "--cover", cover.toString()
+        );
+        assertEquals(0, create.exitCode(), create.err());
+        assertTrue(create.out().contains("Demo Pack"));
+
+        Invocation scan = invoke("--data", data.toString(), "project", "scan", "demo");
+        assertEquals(0, scan.exitCode(), scan.err());
+        assertTrue(scan.out().contains("1 changes"));
+
+        Path changelogFile = temporary.resolve("changelog.txt");
+        Files.writeString(changelogFile, "删除信雅互联残留文件\n保留玩家本地设置");
+        Invocation publish = invoke(
+                "--data", data.toString(), "project", "publish", "demo",
+                "--version", "1.0.0",
+                "--changelog-file", changelogFile.toString(),
+                "--confirm-player-upgrade",
+                "--yes"
+        );
+        assertEquals(0, publish.exitCode(), publish.err());
+        assertTrue(publish.out().contains("Published 1.0.0"));
+
+        ManagementPaths managementPaths = ManagementPaths.at(data);
+        ManagementDatabase managementDatabase = new ManagementDatabase(
+                managementPaths, new JsonCodec());
+        managementDatabase.initialize();
+        var latestRelease = managementDatabase.latestRelease("demo").orElseThrow();
+        String releaseId = latestRelease.releaseId();
+        assertEquals("删除信雅互联残留文件\n保留玩家本地设置",
+                latestRelease.changelog());
+        assertEquals(List.of("mods"), managementDatabase.readManifest(
+                latestRelease).cleanupDirectories());
+
+        Invocation releases = invoke("--data", data.toString(), "--json", "project", "releases", "demo");
+        assertEquals(0, releases.exitCode(), releases.err());
+        assertTrue(releases.out().contains("\"displayVersion\":\"1.0.0\""));
+
+        Path playerSource = Files.createDirectories(temporary.resolve("player-program"));
+        Files.writeString(playerSource.resolve("player.cmd"), "player-cli-content");
+        Invocation playerPublish = invoke(
+                "--data", data.toString(), "player", "publish", "demo",
+                "--platform", "windows-x64",
+                "--version", "0.2.0",
+                "--source", playerSource.toString(),
+                "--launcher", "player.cmd",
+                "--yes"
+        );
+        assertEquals(0, playerPublish.exitCode(), playerPublish.err());
+        assertTrue(playerPublish.out().contains("Published player program 0.2.0"));
+
+        Invocation playerList = invoke(
+                "--data", data.toString(), "--json", "player", "list", "demo",
+                "--platform", "windows-x64"
+        );
+        assertEquals(0, playerList.exitCode(), playerList.err());
+        assertTrue(playerList.out().contains("\"version\":\"0.2.0\""));
+
+        Path instance = Files.createDirectories(temporary.resolve("instance"));
+        Path bootstrap = Files.createDirectories(instance.resolve(".dreamingfish-bootstrap"));
+        Files.writeString(bootstrap.resolve("bootstrap-agent.jar"), "agent");
+        Path playerHome = Files.createDirectories(instance.resolve("DreamingFishUpdater"));
+        Path installedProgram = Files.createDirectories(playerHome.resolve("app/0.2.0"));
+        Files.copy(playerSource.resolve("player.cmd"), installedProgram.resolve("player.cmd"));
+        Path state = Files.createDirectories(playerHome.resolve("state"));
+        Files.writeString(state.resolve("active-player.properties"), """
+                schema=1
+                version=0.2.0
+                launcher=app/0.2.0/player.cmd
+                programRoot=app/0.2.0
+                manifestSha256=
+                timeoutSeconds=3600
+                """);
+        Invocation binding = invoke(
+                "--data", data.toString(), "project", "binding", "demo",
+                "--instance", instance.toString(), "--platform", "windows-x64",
+                "--release", releaseId
+        );
+        assertEquals(0, binding.exitCode(), binding.err());
+        assertTrue(Files.isRegularFile(
+                instance.resolve(".dreamingfish-bootstrap/project-binding.json")));
+        assertEquals("desktop-cover", Files.readString(
+                instance.resolve(".dreamingfish-bootstrap/project-cover")));
+        ProjectBinding writtenBinding = new JsonCodec().read(instance.resolve(
+                ".dreamingfish-bootstrap/project-binding.json"), ProjectBinding.class);
+        assertEquals(".dreamingfish-bootstrap/project-cover",
+                writtenBinding.bundledCoverPath());
+        assertTrue(Files.isRegularFile(instance.resolve(
+                ".dreamingfish-bootstrap/bundled-release/manifest.json")));
+        assertTrue(Files.isRegularFile(instance.resolve("mods/example.jar")));
+        String active = Files.readString(state.resolve("active-player.properties"));
+        assertTrue(active.matches("(?s).*manifestSha256=[0-9a-f]{64}.*"));
+    }
+
+    @Test
+    void firstRunWizardPersistsSettingsAndPublishesOnlyTheSourceContents() throws Exception {
+        Path adminHome = Files.createDirectories(temporary.resolve("interactive-admin"));
+        Path settingsFile = adminHome.resolve("management-settings.json");
+        Path data = adminHome.resolve("data").toAbsolutePath().normalize();
+        Path source = Files.createDirectories(temporary.resolve("partial-source"));
+        Files.createDirectories(source.resolve("mods"));
+        Files.createDirectories(source.resolve("config"));
+        Files.writeString(source.resolve("mods/example.jar"), "mod-content");
+        Files.writeString(source.resolve("config/example.toml"), "config-content");
+
+        String input = String.join(System.lineSeparator(),
+                "",
+                "18081",
+                "18081",
+                "",
+                "n",
+                "interactive-pack",
+                "交互测试整合包",
+                source.toString(),
+                "http://127.0.0.1:18081",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "n",
+                "4",
+                "1.0.0",
+                "",
+                "首次发布",
+                "y",
+                "y",
+                "0",
+                ""
+        );
+
+        Invocation invocation = invokeWithInput(settingsFile, input);
+        assertEquals(0, invocation.exitCode(), invocation.err());
+        assertTrue(invocation.out().contains("首次使用引导"));
+        assertTrue(invocation.out().contains("欢迎使用三秋叶更新器"));
+        assertTrue(invocation.out().contains("[1/3] 管理端数据保存位置"));
+        assertTrue(invocation.out().contains(
+                "0.0.0.0   = 允许其他电脑连接"));
+        assertTrue(invocation.out().contains(
+                "127.0.0.1 = 只有当前电脑能连接"));
+        assertTrue(invocation.out().contains("这里填写的不是公网 IP"));
+        assertTrue(invocation.out().contains(
+                "按 Y 进入 Web 管理界面创建，按 N 使用命令行创建"));
+        assertTrue(invocation.out().contains("是否现在启动 Web 管理界面并创建第一个项目"));
+        assertTrue(invocation.out().contains("[1/3] 创建必备设置"));
+        assertTrue(invocation.out().contains("[2/3] 文件维护方式"));
+        assertTrue(invocation.out().contains("project policy"));
+        assertTrue(invocation.out().contains("[3/3] 玩家端个性化"));
+        assertTrue(invocation.out().contains(
+                "主菜单 [12]“修改玩家端个性化设置”继续调整"));
+        assertTrue(invocation.out().contains("玩家端更新器访问地址（可留空）"));
+        assertTrue(invocation.out().contains("显示在首页左侧的大号标题区域"));
+        assertTrue(invocation.out().contains("显示在主标题下方"));
+        assertTrue(invocation.out().contains(
+                "Web 管理端口不能与 HTTP 文件服务端口相同，请重新输入"));
+        assertTrue(invocation.out().contains("  " + data));
+        assertTrue(invocation.out().contains("非常重要，请勿删除"));
+        assertTrue(invocation.out().contains("移动或复制到新版管理端根目录"));
+        assertTrue(!invocation.out().contains("管理数据目录 ["));
+        assertTrue(invocation.out().contains("本次内容范围：config/、mods/"));
+        assertTrue(invocation.out().contains("实际将保存的更新记录："));
+        assertTrue(invocation.out().contains("首次发布"));
+        assertTrue(invocation.out().contains("发布完成：1.0.0"));
+        assertTrue(Files.isRegularFile(settingsFile));
+
+        ManagementSettings settings = new ManagementSettingsStore(settingsFile).load();
+        assertEquals(data.toAbsolutePath().normalize().toString(), settings.dataDirectory());
+        assertEquals("interactive-pack", settings.defaultProjectId());
+        assertEquals(18081, settings.httpPort());
+        assertEquals(18080, settings.webPort());
+
+        ManagementPaths paths = ManagementPaths.at(data);
+        ManagementDatabase database = new ManagementDatabase(paths, new JsonCodec());
+        database.initialize();
+        var createdProject = database.requireProject("interactive-pack");
+        assertEquals("交互测试整合包", createdProject.branding().productName());
+        assertEquals("Minecraft 整合包更新", createdProject.branding().subtitle());
+        assertEquals("三秋叶更新器", createdProject.branding().brandName());
+        assertEquals("SanQiuYe", createdProject.branding().brandEnglishName());
+        var release = database.latestRelease("interactive-pack").orElseThrow();
+        assertEquals("首次发布", release.changelog());
+        var managedPaths = database.readManifest(release).files().stream()
+                .map(file -> file.path())
+                .toList();
+        assertEquals(List.of("config/example.toml", "mods/example.jar"), managedPaths);
+
+        String secondInput = String.join(System.lineSeparator(),
+                "8",
+                "127.0.0.1",
+                "18082",
+                "",
+                "0",
+                ""
+        );
+        Invocation secondRun = invokeWithInput(settingsFile, secondInput);
+        assertEquals(0, secondRun.exitCode(), secondRun.err());
+        assertTrue(!secondRun.out().contains("首次使用引导"));
+        assertTrue(secondRun.out().contains("[8] 修改服务设置"));
+        assertTrue(secondRun.out().contains("服务设置已保存。"));
+        assertTrue(!secondRun.out().contains("修改管理数据目录"));
+
+        ManagementSettings updated = new ManagementSettingsStore(settingsFile).load();
+        assertEquals(data.toString(), updated.dataDirectory());
+        assertEquals("127.0.0.1", updated.httpHost());
+        assertEquals(18082, updated.httpPort());
+        assertEquals(18080, updated.webPort());
+
+        String personalizationInput = String.join(System.lineSeparator(),
+                "12",
+                "星河服",
+                "StarRiver",
+                "欢迎来到星河",
+                "星河主页",
+                "和朋友一起探索新的世界",
+                "play.example.com:25565",
+                "not-a-color",
+                "#112233",
+                "#445566",
+                "#f0e1c2",
+                "",
+                "35",
+                "",
+                "-",
+                "",
+                "",
+                "0",
+                ""
+        );
+        Invocation personalizationRun = invokeWithInput(
+                settingsFile, personalizationInput);
+        assertEquals(0, personalizationRun.exitCode(), personalizationRun.err());
+        assertTrue(personalizationRun.out().contains(
+                "[12] 修改玩家端个性化设置"));
+        assertTrue(personalizationRun.out().contains(
+                "颜色必须使用 #RRGGBB 格式"));
+        assertTrue(personalizationRun.out().contains(
+                "玩家端个性化设置已更新：interactive-pack"));
+
+        var personalizedProject = database.requireProject("interactive-pack");
+        assertEquals("星河服", personalizedProject.branding().brandName());
+        assertEquals("StarRiver",
+                personalizedProject.branding().brandEnglishName());
+        assertEquals("欢迎来到星河",
+                personalizedProject.branding().welcomeText());
+        assertEquals("星河主页",
+                personalizedProject.branding().productName());
+        assertEquals("和朋友一起探索新的世界",
+                personalizedProject.branding().subtitle());
+        assertEquals("play.example.com:25565",
+                personalizedProject.branding().serverAddress());
+        assertEquals("#112233",
+                personalizedProject.branding().accentColor());
+        assertEquals("#445566",
+                personalizedProject.branding().secondaryAccentColor());
+        assertEquals("#f0e1c2",
+                personalizedProject.branding().titleColor());
+        assertEquals(0.35d,
+                personalizedProject.branding().topBarOpacity());
+    }
+
+    @Test
+    void migratesSchemaOneSettingsToTheLoopbackWebDefault() throws Exception {
+        Path adminHome = Files.createDirectories(temporary.resolve("legacy-admin"));
+        Path settingsFile = adminHome.resolve("management-settings.json");
+        Files.writeString(settingsFile, """
+                {
+                  "schemaVersion": 1,
+                  "dataDirectory": "legacy-data",
+                  "defaultProjectId": "",
+                  "httpHost": "0.0.0.0",
+                  "httpPort": 8080
+                }
+                """);
+
+        ManagementSettings settings = new ManagementSettingsStore(settingsFile).load();
+
+        assertEquals(ManagementSettings.CURRENT_SCHEMA, settings.schemaVersion());
+        assertEquals(adminHome.resolve("legacy-data").toAbsolutePath().normalize().toString(),
+                settings.dataDirectory());
+        assertEquals("0.0.0.0", settings.httpHost());
+        assertEquals(8080, settings.httpPort());
+        assertEquals(ManagementSettings.DEFAULT_WEB_PORT, settings.webPort());
+        assertEquals("127.0.0.1", settings.webHost());
+    }
+
+    @Test
+    void migratesSchemaTwoSettingsToTheLoopbackWebDefault() throws Exception {
+        Path adminHome = Files.createDirectories(temporary.resolve("schema-two-admin"));
+        Path settingsFile = adminHome.resolve("management-settings.json");
+        Files.writeString(settingsFile, """
+                {
+                  "schemaVersion": 2,
+                  "dataDirectory": "legacy-data",
+                  "defaultProjectId": "",
+                  "httpHost": "0.0.0.0",
+                  "httpPort": 8080,
+                  "webPort": 18081
+                }
+                """);
+
+        ManagementSettings settings = new ManagementSettingsStore(settingsFile).load();
+
+        assertEquals(ManagementSettings.CURRENT_SCHEMA, settings.schemaVersion());
+        assertEquals(18081, settings.webPort());
+        assertEquals("127.0.0.1", settings.webHost());
+    }
+
+    @Test
+    void relocatedLegacyAbsoluteDataRequiresExplicitIdentityConfirmation() throws Exception {
+        Path newHome = Files.createDirectories(temporary.resolve("new-admin"));
+        Path settingsFile = newHome.resolve("management-settings.json");
+        Path oldData = temporary.resolve("old-version/data").toAbsolutePath().normalize();
+        Files.writeString(settingsFile, """
+                {
+                  "schemaVersion": 2,
+                  "dataDirectory": "%s",
+                  "defaultProjectId": "",
+                  "httpHost": "0.0.0.0",
+                  "httpPort": 8080,
+                  "webPort": 18080
+                }
+                """.formatted(oldData.toString().replace("\\", "\\\\")));
+        Path localData = Files.createDirectories(newHome.resolve("data"));
+        Files.writeString(localData.resolve("management.db"), "moved-database");
+
+        assertThrows(cn.dreamingfish.updater.management.ManagementException.class,
+                () -> new ManagementSettingsStore(settingsFile).load());
+        assertTrue(Files.readString(settingsFile).contains("old-version"));
+        Files.createDirectories(oldData);
+        assertEquals(oldData.toString(), new ManagementSettingsStore(settingsFile).load().dataDirectory());
+        ManagementSettingsStore store = new ManagementSettingsStore(settingsFile);
+        store.save(store.load().withDataDirectory(localData.toString()));
+        assertEquals("data", new com.fasterxml.jackson.databind.ObjectMapper().readTree(settingsFile.toFile()).get("dataDirectory").asText());
+
+    }
+
+    @Test
+    void managesMaintenanceRulesFromTheCommandLine() throws Exception {
+        String data = temporary.resolve("policy-data").toString();
+        Path source = Files.createDirectories(temporary.resolve("policy-source"));
+        Files.createDirectories(source.resolve("mods"));
+        Files.createDirectories(source.resolve("config"));
+        try (var jar = new java.util.zip.ZipOutputStream(
+                Files.newOutputStream(source.resolve("mods/iris.jar")))) {
+            jar.putNextEntry(new java.util.zip.ZipEntry("fabric.mod.json"));
+            jar.write("{\"schemaVersion\":1,\"id\":\"iris\",\"version\":\"1.7\"}"
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            jar.closeEntry();
+        }
+        Files.writeString(source.resolve("config/a.toml"), "a=1");
+        assertEquals(0, invoke("--data", data, "init").exitCode());
+        assertEquals(0, invoke("--data", data, "project", "create", "demo", "--name", "Demo",
+                "--source", source.toString(), "--public-url", "http://127.0.0.1:18080").exitCode());
+
+        Invocation preset = invoke("--data", data, "project", "policy", "preset", "demo",
+                "config", "INITIAL", "--directory");
+        assertEquals(0, preset.exitCode(), preset.err());
+        assertTrue(preset.out().matches("(?s).*首次提供\\s+config/（文件夹）.*"), preset.out());
+        Invocation cleanup = invoke("--data", data, "project", "policy", "cleanup", "demo",
+                "mods", "--on", "--yes");
+        assertEquals(0, cleanup.exitCode(), cleanup.err());
+        assertTrue(cleanup.out().contains("完整强制同步的目录：mods"), cleanup.out());
+        assertEquals(0, invoke("--data", data, "project", "policy", "preset", "demo", "mods", "SYNC", "--directory").exitCode());
+        Invocation group = invoke("--data", data, "project", "policy", "group", "demo",
+                "--title", "光影", "--default-off");
+        assertEquals(0, group.exitCode(), group.err());
+        String groupId = group.out().replaceAll("(?s).*可选内容已保存：光影 \\[([^\\]]+)\\].*", "$1");
+        Invocation members = invoke("--data", data, "project", "policy", "group-members", "demo",
+                groupId, "--add", "mods/iris.jar");
+        assertEquals(0, members.exitCode(), members.err());
+        assertTrue(members.out().contains("模组：iris"), members.out());
+
+        for (String version : List.of("1.0", "1.1")) {
+            if (version.equals("1.1")) Files.writeString(source.resolve("config/a.toml"), "a=2");
+            assertEquals(0, invoke("--data", data, "project", "scan", "demo").exitCode());
+            Invocation publish = invoke("--data", data, "project", "publish", "demo",
+                    "--version", version, "--confirm-player-upgrade", "--yes");
+            assertEquals(0, publish.exitCode(), publish.err());
+        }
+
+        Invocation history = invoke("--data", data, "project", "policy", "history", "demo", "a.toml");
+        assertEquals(0, history.exitCode(), history.err());
+        assertTrue(history.out().contains("当前发布"), history.out());
+        String oldVersion = history.out().lines()
+                .filter(line -> line.startsWith("  ") && !line.contains("当前发布"))
+                .findFirst().orElseThrow().trim().substring(0, 12);
+
+        Invocation refused = invoke("--data", data, "project", "policy", "withdraw", "demo",
+                "config/a.toml=ffffffff", "--reason", "坏配置", "--yes");
+        assertTrue(refused.exitCode() != 0);
+        assertTrue(refused.err().contains("没有找到这个版本"), refused.err());
+        Invocation withdraw = invoke("--data", data, "project", "policy", "withdraw", "demo",
+                "config/a.toml=" + oldVersion, "--reason", "旧配置会崩溃", "--yes");
+        assertEquals(0, withdraw.exitCode(), withdraw.err());
+        assertTrue(withdraw.out().contains("旧配置会崩溃"), withdraw.out());
+        Invocation correct = invoke("--data", data, "project", "policy", "correct", "demo",
+                "config/a.toml", "--mode", "KNOWN_BAD", "--bad", oldVersion,
+                "--reason", "换回新配置", "--yes");
+        assertEquals(0, correct.exitCode(), correct.err());
+        assertTrue(correct.out().contains("替换已知旧版本"), correct.out());
+
+        Invocation json = invoke("--data", data, "--json", "project", "policy", "show", "demo");
+        assertEquals(0, json.exitCode(), json.err());
+        assertTrue(json.out().contains("\"cleanupDirectories\":[]"), json.out());
+        java.util.Map<?, ?> rules = new JsonCodec().read(
+                json.out().trim().getBytes(java.nio.charset.StandardCharsets.UTF_8), java.util.Map.class);
+        String withdrawalId = ((java.util.Map<?, ?>) ((List<?>) rules.get("withdrawals")).getFirst())
+                .get("id").toString();
+        String correctionId = ((java.util.Map<?, ?>) ((List<?>) rules.get("corrections")).getFirst())
+                .get("id").toString();
+        assertEquals(0, invoke("--data", data, "project", "policy", "withdrawal-revoke", "demo",
+                withdrawalId).exitCode());
+        assertEquals(0, invoke("--data", data, "project", "policy", "correction-revoke", "demo",
+                correctionId).exitCode());
+        Invocation deleted = invoke("--data", data, "project", "policy", "group-delete", "demo",
+                groupId, "--yes");
+        assertEquals(0, deleted.exitCode(), deleted.err());
+        assertTrue(deleted.out().contains("可选内容：（无）"), deleted.out());
+        assertTrue(deleted.out().contains("撤回问题版本：（无）"), deleted.out());
+    }
+
+    @Test
+    void explicitReleaseOverridesDefaultRemovalAndPersistsPlayerOwnership() throws Exception {
+        String data = temporary.resolve("removal-admin/data").toString();
+        Path source = Files.createDirectories(temporary.resolve("removal-source/config"));
+        Path file = source.resolve("player.toml");
+        Files.writeString(file, "personal-setting=1");
+        Invocation create = invoke("--data", data, "project", "create", "removal-demo",
+                "--name", "Removal demo", "--source", source.getParent().toString(),
+                "--public-url", "http://127.0.0.1:18081");
+        assertEquals(0, create.exitCode(), create.err());
+        assertEquals(0, invoke("--data", data, "project", "scan", "removal-demo").exitCode());
+        Invocation first = invoke("--data", data, "project", "publish", "removal-demo",
+                "--version", "1", "--confirm-player-upgrade", "--yes");
+        assertEquals(0, first.exitCode(), first.err());
+        Files.delete(file);
+        assertEquals(0, invoke("--data", data, "project", "scan", "removal-demo").exitCode());
+        Invocation second = invoke("--data", data, "project", "publish", "removal-demo",
+                "--version", "2", "--removed-files", "RELEASE", "--confirm-player-upgrade", "--yes");
+        assertEquals(0, second.exitCode(), second.err());
+        ManagementDatabase database = new ManagementDatabase(ManagementPaths.at(Path.of(data)), new JsonCodec());
+        database.initialize();
+        var target = database.readManifest(database.latestRelease("removal-demo").orElseThrow());
+        assertEquals(List.of("config/player.toml"), target.releasedPaths());
+        assertTrue(target.withdrawals().isEmpty());
+        assertEquals(0, invoke("--data", data, "project", "scan", "removal-demo").exitCode());
+        Invocation third = invoke("--data", data, "project", "publish", "removal-demo",
+                "--version", "3", "--confirm-player-upgrade", "--yes");
+        assertEquals(0, third.exitCode(), third.err());
+        assertEquals(target.releasedPaths(), database.readManifest(
+                database.latestRelease("removal-demo").orElseThrow()).releasedPaths());
+    }
+
+    @Test
+    void nonInteractiveOperationsReturnOneJsonDocument() throws Exception {
+        String data = temporary.resolve("operations-data").toString();
+        Path source = Files.createDirectories(temporary.resolve("operations-source/config"));
+        Files.writeString(source.resolve("options.toml"), "render_distance=12");
+        Invocation create = invoke("--data", data, "project", "create", "operations-demo",
+                "--name", "Operations demo", "--source", source.getParent().toString(),
+                "--public-url", "https://updates.example.com");
+        assertEquals(0, create.exitCode(), create.err());
+        assertEquals(0, invoke("--data", data, "project", "scan", "operations-demo").exitCode());
+        Invocation publish = invoke("--data", data, "project", "publish", "operations-demo",
+                "--version", "1.0.0", "--minimum-player-version", "0.2.0",
+                "--confirm-player-upgrade", "--yes");
+        assertEquals(0, publish.exitCode(), publish.err());
+        assertEquals(0, invoke("--data", data, "project", "policy", "preset", "operations-demo",
+                "config/options.toml", "INITIAL").exitCode());
+        var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        var history = mapper.readTree(invoke("--data", data, "--json", "project", "operations",
+                "operations-demo").out());
+        String operationId = history.get(0).get("id").asText();
+        Invocation undo = invoke("--data", data, "--json", "project", "operations", "operations-demo",
+                "--undo", operationId, "--yes");
+        assertEquals(0, undo.exitCode(), undo.err());
+        try (var parser = mapper.createParser(undo.out())) {
+            com.fasterxml.jackson.databind.JsonNode output = mapper.readTree(parser);
+            assertTrue(output.has("preview") && output.has("result"));
+            assertEquals(null, parser.nextToken(), "An agent must receive one complete JSON document");
+        }
+        assertEquals(0, invoke("--data", data, "project", "policy", "preset", "operations-demo",
+                "config/options.toml", "INITIAL").exitCode());
+        Invocation restore = invoke("--data", data, "--json", "project", "operations", "operations-demo",
+                "--restore-published", "--yes");
+        assertEquals(0, restore.exitCode(), restore.err());
+        try (var parser = mapper.createParser(restore.out())) {
+            com.fasterxml.jackson.databind.JsonNode output = mapper.readTree(parser);
+            assertEquals("1.0.0", output.get("preview").get("displayVersion").asText());
+            assertTrue(output.has("result"));
+            assertEquals(null, parser.nextToken());
+        }
+    }
+
+    @Test
+    void projectCreatedWithoutAnAddressPublishesOnceItIsSet() throws Exception {
+        String data = temporary.resolve("data").toString();
+        Path source = Files.createDirectories(temporary.resolve("source/mods")).getParent();
+        Files.writeString(source.resolve("mods/a.jar"), "a");
+        assertEquals(0, invoke("--data", data, "init").exitCode());
+        Invocation create = invoke("--data", data, "project", "create", "later",
+                "--name", "Later", "--source", source.toString());
+        assertEquals(0, create.exitCode(), create.err());
+        assertTrue(create.out().contains("not set"), create.out());
+        String[] publish = {"--data", data, "project", "publish", "later", "--version", "1.0.0",
+                "--confirm-player-upgrade", "--yes"};
+
+        assertEquals(0, invoke("--data", data, "project", "scan", "later").exitCode());
+        Invocation refused = invoke(publish);
+        assertTrue(refused.exitCode() != 0);
+        assertTrue(refused.err().contains("玩家更新地址"), refused.err());
+
+        assertEquals(0, invoke("--data", data, "project", "configure", "later",
+                "--public-url", "http://play.example.test:8080").exitCode());
+        assertEquals(0, invoke("--data", data, "project", "scan", "later").exitCode());
+        Invocation published = invoke(publish);
+        assertEquals(0, published.exitCode(), published.err());
+    }
+
+    private Invocation invoke(String... args) {
+        StringWriter standardOutput = new StringWriter();
+        StringWriter standardError = new StringWriter();
+        int exit = ManagementCli.execute(
+                args,
+                new PrintWriter(standardOutput, true),
+                new PrintWriter(standardError, true)
+        );
+        return new Invocation(exit, standardOutput.toString(), standardError.toString());
+    }
+
+    private Invocation invokeWithInput(Path settingsFile, String input, String... args) {
+        StringWriter standardOutput = new StringWriter();
+        StringWriter standardError = new StringWriter();
+        int exit = ManagementCli.execute(
+                args,
+                new StringReader(input),
+                settingsFile,
+                new PrintWriter(standardOutput, true),
+                new PrintWriter(standardError, true)
+        );
+        return new Invocation(exit, standardOutput.toString(), standardError.toString());
+    }
+
+    private record Invocation(int exitCode, String out, String err) {
+    }
+}

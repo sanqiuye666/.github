@@ -1,0 +1,105 @@
+package cn.dreamingfish.updater.management;
+
+import java.io.IOException;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileSystemException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.Comparator;
+
+final class AtomicFiles {
+    private AtomicFiles() {
+    }
+
+    static void moveReplace(Path source, Path target) throws IOException {
+        cn.dreamingfish.updater.protocol.PathSafety.assertSafePathTree(source);
+        cn.dreamingfish.updater.protocol.PathSafety.createSafeDirectories(target.toAbsolutePath().normalize().getParent());
+        cn.dreamingfish.updater.protocol.PathSafety.assertSafePathTree(target);
+        FileSystemException lastFailure = null;
+        for (int attempt = 0; attempt < 5; attempt++) {
+            try {
+                Files.move(source, target, StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING);
+                syncDirectory(target.getParent());return;
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+                syncDirectory(target.getParent());return;
+            } catch (FileSystemException e) {
+                lastFailure = e;
+                if (attempt < 4) waitForTransientWindowsLock(attempt);
+            }
+        }
+        throw lastFailure;
+    }
+
+    private static void waitForTransientWindowsLock(int attempt) throws IOException {
+        try {
+            Thread.sleep(25L << attempt);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while retrying an atomic file move", e);
+        }
+    }
+
+    static void write(Path target, byte[] bytes) throws IOException {
+        cn.dreamingfish.updater.protocol.PathSafety.createSafeDirectories(target.toAbsolutePath().normalize().getParent());
+        cn.dreamingfish.updater.protocol.PathSafety.assertSafePathTree(target);
+        Path temporary = Files.createTempFile(target.getParent(), target.getFileName().toString(), ".tmp");
+        boolean moved = false;
+        try {
+            Files.write(temporary, bytes);
+            force(temporary);
+            moveReplace(temporary, target);
+            moved = true;
+        } finally {
+            if (!moved) {
+                Files.deleteIfExists(temporary);
+            }
+        }
+    }
+
+    static void copyReplace(Path source, Path target) throws IOException {
+        cn.dreamingfish.updater.protocol.PathSafety.assertSafePathTree(source);
+        cn.dreamingfish.updater.protocol.PathSafety.createSafeDirectories(target.toAbsolutePath().normalize().getParent());
+        cn.dreamingfish.updater.protocol.PathSafety.assertSafePathTree(target);
+        Path temporary = Files.createTempFile(target.getParent(), target.getFileName().toString(), ".tmp");
+        boolean moved = false;
+        try {
+            Files.copy(source, temporary, StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.COPY_ATTRIBUTES);
+            force(temporary);
+            moveReplace(temporary, target);
+            moved = true;
+        } finally {
+            if (!moved) {
+                Files.deleteIfExists(temporary);
+            }
+        }
+    }
+
+    static void syncDirectory(Path directory)throws IOException {
+        if(directory!=null&&directory.getFileSystem().supportedFileAttributeViews().contains("posix")){
+            try(var channel=java.nio.channels.FileChannel.open(directory,java.nio.file.StandardOpenOption.READ)){channel.force(true);}
+        }
+    }
+
+    static void force(Path file) throws IOException {
+        try (var channel = java.nio.channels.FileChannel.open(file, java.nio.file.StandardOpenOption.WRITE)) {
+            channel.force(true);
+        }
+    }
+
+    static void deleteRecursively(Path root) throws IOException {
+        cn.dreamingfish.updater.protocol.PathSafety.assertSafePathTree(root);
+        if (!Files.exists(root)) {
+            return;
+        }
+        try (var stream = Files.walk(root)) {
+            for (Path path : stream.sorted(Comparator.reverseOrder()).toList()) {
+                cn.dreamingfish.updater.protocol.PathSafety.assertSafePathTree(path);
+                Files.deleteIfExists(path);
+            }
+        }
+    }
+}

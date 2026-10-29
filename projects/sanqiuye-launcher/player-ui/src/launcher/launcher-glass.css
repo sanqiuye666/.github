@@ -1,0 +1,79 @@
+/* 玻璃外观集中在展示层；不改变布局、透明度偏好或业务交互。 */
+.launcher-shell:is(.theme-light, .theme-forest) {
+  --glass-surface: linear-gradient(145deg, #365046b8, #14271fdb);
+  --glass-edge: #d6f0e21f;
+  --glass-highlight: #edfff012;
+  --glass-shadow: 0 10px 30px #00000020, inset 0 1px 0 var(--glass-highlight);
+  --glass-navigation: #11271fb3;
+  --glass-dialog: #162c24f2;
+  background: radial-gradient(ellipse at 88% 8%, #356b5859, transparent 55%),
+    radial-gradient(ellipse at 12% 95%, #92724526, transparent 50%), #101e18;
+}
+.launcher-shell.theme-light {
+  --glass-surface: linear-gradient(145deg, #ffffffd9, #ffffffa6);
+  --glass-edge: #ffffffd9;
+  --glass-highlight: #ffffffed;
+  --glass-shadow: 0 10px 30px #345b4510, 0 1px 3px #345b4508, inset 0 1px 0 var(--glass-highlight);
+  --glass-navigation: #f7fcf6ad;
+  --glass-dialog: #f7fcf7f2;
+  background: radial-gradient(ellipse at 88% 8%, #c7e3d4b3, transparent 57%),
+    radial-gradient(ellipse at 12% 95%, #f2deb78c, transparent 55%), #edf3ee;
+}
+.launcher-shell:is(.theme-light, .theme-forest) .launcher-titlebar,
+.launcher-shell:is(.theme-light, .theme-forest) .launcher-sidebar {
+  background: var(--glass-navigation);
+  border-color: var(--glass-edge);
+  backdrop-filter: blur(20px) saturate(115%);
+}
+.launcher-shell:is(.theme-light, .theme-forest) :is(.launcher-glass, .workspace-settings, .launcher-login-card) {
+  background: var(--glass-surface);
+  border: 1px solid var(--glass-edge);
+  box-shadow: var(--glass-shadow);
+  backdrop-filter: blur(16px) saturate(115%);
+}
+.launcher-shell:is(.theme-light, .theme-forest) .workspace-widget {
+  background: linear-gradient(145deg, #ffffff08, transparent 70%),
+    rgb(24 41 34 / var(--workspace-opacity, 92%));
+  border-color: var(--glass-edge);
+  box-shadow: var(--glass-shadow);
+  backdrop-filter: blur(16px) saturate(115%);
+}
+.launcher-shell.theme-light .workspace-widget {
+  background: linear-gradient(145deg, #ffffff38, transparent 70%),
+    rgb(255 255 255 / var(--workspace-opacity, 92%));
+}
+.launcher-shell:is(.theme-light, .theme-forest) :is(.launcher-modal, .workspace-editor, .feature-status-dialog) {
+  background: var(--glass-dialog) !important;
+  border-color: var(--glass-edge);
+  box-shadow: 0 24px 70px #0c241d33, inset 0 1px 0 var(--glass-highlight);
+}
+.launcher-shell:is(.theme-light, .theme-forest) :is(.workspace-overlay, .launcher-modal-backdrop, .feature-status-backdrop) {
+  backdrop-filter: blur(8px);
+}
+.launcher-shell:is(.theme-light, .theme-forest) .workspace-editor-actions { background: var(--glass-dialog) !important; }
+.launcher-shell:is(.theme-light, .theme-forest) .launcher-hero { box-shadow: var(--glass-shadow); }
+.launcher-shell:is(.theme-light, .theme-forest) .launcher-content:focus-visible {
+  outline: 2px solid var(--launcher-accent, #72cbb2);
+  outline-offset: -3px;
+}
+.launcher-shell:is(.theme-light, .theme-forest) .launcher-secondary {
+  box-shadow: inset 0 1px 0 var(--glass-highlight);
+}
+.launcher-shell.theme-light .launcher-secondary {
+  background: #ffffff99;
+  border-color: #c4d7cc99 !important;
+}
+.launcher-shell.theme-light .workspace-maid {
+  background: linear-gradient(115deg, #fff8e8db, #fffaf0a6);
+  box-shadow: inset 0 1px 0 #ffffffc9;
+}
+/* 不支持模糊或用户减少透明效果时，仍有完整的可读表面。 */
+@supports not (backdrop-filter: blur(1px)) {
+  .launcher-shell:is(.theme-light, .theme-forest) :is(.launcher-glass, .workspace-settings, .launcher-login-card) { background: var(--glass-dialog); }
+}
+@media (prefers-reduced-transparency: reduce) {
+  .launcher-shell:is(.theme-light, .theme-forest) { --glass-navigation: #14271f; --glass-dialog: #162c24; }
+  .launcher-shell.theme-light { --glass-navigation: #f7fcf6; --glass-dialog: #f7fcf7; }
+  .launcher-shell:is(.theme-light, .theme-forest) :is(.launcher-glass, .workspace-widget, .workspace-settings, .launcher-login-card) { background: var(--glass-dialog); }
+  .launcher-shell:is(.theme-light, .theme-forest) :is(.launcher-titlebar, .launcher-sidebar, .launcher-glass, .workspace-widget, .workspace-settings, .launcher-login-card, .workspace-overlay, .launcher-modal-backdrop, .feature-status-backdrop) { backdrop-filter: none; }
+}

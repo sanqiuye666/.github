@@ -1,0 +1,26 @@
+package cn.dreamingfish.dispatch.server.real;
+import cn.dreamingfish.dispatch.server.config.ServerConfig;import cn.dreamingfish.dispatch.server.model.*;import cn.dreamingfish.dispatch.server.model.ServerModels.*;
+import com.fasterxml.jackson.databind.JsonNode;import java.nio.file.Path;import java.time.Instant;import java.util.*;import java.util.concurrent.atomic.AtomicReference;
+/** 真实账号客户端：会话只在后台内存，不返回Vue，不伪装其余远端能力已实现。 */
+public final class HttpAccountServer extends AccountsOnlyServer {
+ private record Session(String token,Account account,Instant expires){@Override public String toString(){return "Session[redacted]";}}
+ private final ServerConfig config;private final AccountHttpTransport http;private final String adminToken;private final AtomicReference<Session> session=new AtomicReference<>();private volatile boolean permissionWarning;private long authenticationGeneration;
+ public HttpAccountServer(ServerConfig config){this.config=config;http=new AccountHttpTransport(config);adminToken=config.role().equals("admin")?ServerSecrets.read(Path.of(config.value("CLOUD_ADMIN_TOKEN_FILE")),code->permissionWarning=true):null;}
+ public Status status(){return new Status(true,"LIVE",config.role(),"","真实账号服务；连接以实际查询为准"+(permissionWarning?"；请检查管理凭据文件权限":""));}
+ private void player(){if(!config.role().equals("player")||!config.flag("ACCOUNTS_ENABLED"))throw RemoteFailure.of("FORBIDDEN");}
+ private Session current(){Session value=session.get();if(value==null||!value.expires().isAfter(Instant.now())){if(value!=null)session.compareAndSet(value,null);throw RemoteFailure.of("AUTH_FAILED");}return value;}
+ // 只同步内存提交；网络等待不占锁。退出会使此前所有认证响应失效。
+ private synchronized long beginAuthentication(CallContext context){context.check();return ++authenticationGeneration;}
+ private synchronized void commitAuthentication(long generation,Session value){if(generation!=authenticationGeneration)throw RemoteFailure.of("CANCELLED");session.set(value);}
+ private synchronized Session endAuthentication(){++authenticationGeneration;return session.getAndSet(null);}
+ private static String field(JsonNode n,String key,int max){var v=n.path(key);if(!v.isTextual()||v.textValue().isBlank()||v.textValue().length()>max)throw RemoteFailure.of("INVALID_DATA");return v.textValue();}
+ private static Account account(JsonNode n){String id=field(n,"id",36);try{UUID.fromString(id);Instant.parse(field(n,"createdAt",64));Instant.parse(field(n,"lastSeenAt",64));}catch(RuntimeException e){throw RemoteFailure.of("INVALID_DATA");}return new Account(id,field(n,"username",32),field(n,"displayName",64),field(n,"groupId",64),n.path("createdAt").asText(),n.path("lastSeenAt").asText());}
+ private Account signedIn(JsonNode n,long generation){var a=account(n.path("account"));String token=field(n,"accessToken",128);if(!token.matches("[A-Za-z0-9_-]{43,128}"))throw RemoteFailure.of("INVALID_DATA");Instant expires;try{expires=Instant.parse(field(n,"expiresAt",64));}catch(RuntimeException e){throw RemoteFailure.of("INVALID_DATA");}if(!expires.isAfter(Instant.now())||expires.isAfter(Instant.now().plusSeconds(86400)))throw RemoteFailure.of("INVALID_DATA");commitAuthentication(generation,new Session(token,a,expires));return a;}
+ @Override public PanelAccountPort panelAccounts(){return new PanelAccountPort(){
+  public Account register(CallContext c,String op,String user,String display,String password){player();if(!config.flag("REGISTRATION_ENABLED"))throw RemoteFailure.of("FEATURE_DISABLED");UUID.fromString(op);long generation=beginAuthentication(c);return signedIn(http.call(c,"account/register",Map.of("operationId",op,"username",user,"displayName",display,"password",password),null),generation);}
+  public Account login(CallContext c,String user,String password){player();long generation=beginAuthentication(c);return signedIn(http.call(c,"account/login",Map.of("username",user,"password",password),null),generation);}
+  public Account current(CallContext c){player();var old=HttpAccountServer.this.current();try{var result=account(http.call(c,"account/me",null,old.token()).path("account"));if(session.get()!=old)throw RemoteFailure.of("CANCELLED");return result;}catch(RemoteFailure e){if(e.code().equals("AUTH_FAILED"))session.compareAndSet(old,null);throw e;}}
+  public Operation logout(CallContext c){player();var old=endAuthentication();if(old==null)throw RemoteFailure.of("AUTH_FAILED");http.call(c,"account/logout",Map.of(),old.token());return new Operation(c.requestId(),"LOGGED_OUT","LIVE","已退出面板账号");}
+  public AccountDirectory list(CallContext c){if(!config.role().equals("admin")||adminToken==null)throw RemoteFailure.of("FORBIDDEN");var n=http.call(c,"admin/accounts",null,adminToken);if(!n.path("accounts").isArray()||n.path("accounts").size()>500||!n.path("total").canConvertToLong()||n.path("total").asLong()<n.path("accounts").size()||n.path("limit").asInt()!=500)throw RemoteFailure.of("INVALID_DATA");var result=new ArrayList<Account>();for(var row:n.path("accounts"))result.add(account(row));String checked=field(n,"checkedAt",64);try{Instant.parse(checked);}catch(RuntimeException e){throw RemoteFailure.of("INVALID_DATA");}return new AccountDirectory(result,n.path("total").asLong(),500,checked);}
+ };}
+}

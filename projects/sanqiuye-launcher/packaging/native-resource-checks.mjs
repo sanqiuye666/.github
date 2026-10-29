@@ -1,0 +1,76 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import net from 'node:net';
+import {spawnSync} from 'node:child_process';
+import {createHash,randomUUID} from 'node:crypto';
+
+const digest=file=>createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+const kinds=[['resourcepacks','RESOURCEPACKS','纹理.zip'],['shaders','SHADERS','光影.zip'],['recordings','RECORDINGS','回放.mcpr'],['schematics','SCHEMATICS','小屋.litematic']];
+
+/** 只在专用验收副本准备容器样本，不将它们冒充完整游戏素材。 */
+export function prepareNativeResources(appRoot,out){
+ const root=path.join(appRoot,'launcher-data'),sources=path.join(out,'选择的资源');fs.mkdirSync(sources);
+ const python=`import sys,zipfile,gzip\nfrom pathlib import Path\np=Path(sys.argv[1])\nfor name,entries in [('纹理.zip',{'pack.mcmeta':b'{"pack":{"pack_format":32,"description":"SQY isolated check"}}'}),('光影.zip',{'shaders/test.fsh':b'void main(){}'}),('回放.mcpr',{'metaData.json':b'{"mcversion":"1.20.6","duration":100}', 'recording.tmcpr':b'\\x00'})]:\n with zipfile.ZipFile(p/name,'w') as z:\n  for key,value in entries.items():z.writestr(key,value)\n(p/'小屋.litematic').write_bytes(gzip.compress(b'\\x0a\\x00\\x00\\x00'))\n(p/'损坏.zip').write_text('not a ZIP')\n`;
+ const result=spawnSync('python',['-X','utf8','-c',python,sources],{encoding:'utf8',windowsHide:true});assert.equal(result.status,0,result.stderr);
+ const another=randomUUID(),base=path.join(root,'instances',another);fs.mkdirSync(path.join(base,'.minecraft/saves/keep'),{recursive:true});fs.writeFileSync(path.join(base,'instance.json'),JSON.stringify({schemaVersion:1,id:another,name:'资源隔离哨兵',gameVersion:'1.21.1',loader:'VANILLA',createdAt:new Date().toISOString(),state:'PREPARED'}));
+ const sentinel=path.join(base,'.minecraft/saves/keep/level.dat');fs.writeFileSync(sentinel,'isolated resource sentinel');
+ return {sources,another,sentinel,sentinelHash:digest(sentinel),sourceHashes:Object.fromEntries(fs.readdirSync(sources).map(name=>[name,digest(path.join(sources,name))]))};
+}
+
+export async function checkNativeResources({app,rpc,preset,screenshot,helper,write,checks,out,evidence}){
+ const {page}=app,instances=(await rpc(app,'/instances')).instances;
+ const instance=instances.find(i=>i.installation&&i.id!==evidence.another)??instances.find(i=>i.id!==evidence.another)??instances[0];assert.ok(instance);
+ evidence.instanceId=instance.id;
+ const select=async(nav,kind)=>{await page.locator(`[data-launcher-page="${nav}"]`).click();await page.locator(`[data-resource-kind="${kind}"]`).waitFor();await page.locator('[data-resource-instance]').selectOption(instance.id);await page.locator('[data-resource-import]').waitFor();await page.waitForFunction(()=>!document.querySelector('[data-resource-refresh]')?.disabled);};
+ const importFile=async file=>{await page.locator('[data-resource-source]').fill(path.join(evidence.sources,file));await page.locator('[data-resource-import]').click();await page.locator(`[data-resource-file="${file}"]`).waitFor({timeout:40000});};
+ for(const [nav,kind,file] of kinds){
+  await select(nav,kind);await importFile(file);const listing=await rpc(app,'/resources?'+new URLSearchParams({instanceId:instance.id,kind}));assert.ok(listing.entries.some(entry=>entry.name===file));assert.equal(digest(path.join(listing.directory,file)),evidence.sourceHashes[file]);
+  const other=await rpc(app,'/resources?'+new URLSearchParams({instanceId:evidence.another,kind}));if(instance.id!==evidence.another)assert.equal(other.entries.length,0);
+  await page.locator(`[data-resource-file="${file}"]`).scrollIntoViewIfNeeded();await screenshot(app,'resources-'+nav);checks.push('native-'+nav+'-import-and-source-isolation');
+ }
+ await select('resourcepacks','RESOURCEPACKS');
+ await page.locator('[data-resource-source]').fill(path.join(evidence.sources,'纹理.zip'));await page.locator('[data-resource-import]').click();await page.getByRole('alert').filter({hasText:'未覆盖'}).waitFor();assert.equal((await rpc(app,'/resources?'+new URLSearchParams({instanceId:instance.id,kind:'RESOURCEPACKS'}))).entries.length,1);
+ await page.locator('[data-resource-source]').fill(path.join(evidence.sources,'损坏.zip'));await page.locator('[data-resource-import]').click();await page.getByRole('alert').filter({hasText:'无效'}).waitFor();checks.push('native-conflict-and-invalid-container-no-overwrite');
+ await page.locator('[data-resource-copy="纹理.zip"]').click();await page.locator('[data-resource-target]').fill('纹理副本.zip');await page.locator('[data-resource-confirm]').click();await page.locator('[data-resource-file="纹理副本.zip"]').waitFor();
+ await page.locator('[data-resource-rename="纹理副本.zip"]').click();await page.locator('[data-resource-target]').fill('新名称.zip');await page.locator('[data-resource-confirm]').click();await page.locator('[data-resource-file="新名称.zip"]').waitFor();assert.equal(await page.locator('[data-resource-file="纹理副本.zip"]').count(),0);
+ await page.locator('[data-resource-remove="新名称.zip"]').click();assert.equal(await page.locator('[data-resource-file="新名称.zip"]').count(),1);await page.locator('[data-resource-confirm]').click();await page.locator('[data-resource-file="新名称.zip"]').waitFor({state:'detached'});
+ await page.locator('.resource-backups summary').click();const removed=(await rpc(app,'/resources?'+new URLSearchParams({instanceId:instance.id,kind:'RESOURCEPACKS'}))).backups.find(b=>b.name==='新名称.zip');assert.ok(removed);await page.locator(`[data-resource-restore="${removed.id}"]`).click();await page.locator('[data-resource-file="新名称.zip"]').waitFor();checks.push('native-copy-rename-confirm-remove-verified-restore');
+ await page.getByRole('button',{name:'打开资源文件夹 ↗',exact:true}).click();await sleep(500);assert.equal(await page.getByRole('alert').count(),0);checks.push('native-launcher-specific-open-folder');
+ const invalidOpen=await page.evaluate(async()=>{try{await window.__TAURI_INTERNALS__.invoke('launcher_open_resource_directory',{instanceId:'../other',kind:'RESOURCEPACKS'});return false;}catch{return true;}});assert.equal(invalidOpen,true);checks.push('native-open-folder-rejects-path-escape');
+ await page.locator('[data-resource-source]').fill('cancel-sentinel');await page.locator('[data-resource-choose]').click();
+ // 精确PID/创建时间/标题的系统文件框专用取消；不向其他窗口发送按键。
+ const cancel=spawnSync('python',['-X','utf8','packaging/tests/windows-resource-picker.py','--pid',String(app.child.pid),'--started-at',app.ownership.processStartedAt],{encoding:'utf8',windowsHide:true,timeout:20000});assert.equal(cancel.status,0,cancel.stderr);write('resource-picker-cancel.json',JSON.parse(cancel.stdout));await page.locator('[data-resource-source]').waitFor();await sleep(300);assert.equal(await page.locator('[data-resource-source]').inputValue(),'cancel-sentinel');checks.push('native-real-file-picker-cancel-without-import');
+ for(const name of ['simple','cards','immersive','workbench'])await preset(app,name);await page.locator('[data-workspace-settings]').click();await page.locator('[data-workspace-theme]').selectOption('forest');await page.locator('[data-close-appearance]').click();
+ helper(['--pid',String(app.child.pid),'--started-at',app.ownership.processStartedAt,'--title','三秋叶启动器','--action','resize','--width','1000','--height','700']);assert.equal(await page.locator('body').evaluate(e=>e.scrollWidth<=innerWidth),true);await screenshot(app,'resources-forest-narrow');checks.push('native-four-layouts-forest-narrow-resources');
+ const sockets=new Set(),packets=[];let accepted=0;const server=net.createServer(socket=>{accepted++;sockets.add(socket);socket.on('close',()=>sockets.delete(socket));socket.on('error',()=>{});socket.on('data',data=>{packets.push(data.subarray(0,128).toString('hex'));socket.end();});});await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const port=server.address().port;
+ try{
+  await page.locator('[data-launcher-page="servers"]').click();await page.locator('[data-server-name]').fill('本机专用连接测试');await page.locator('[data-server-host]').fill('127.0.0.1');await page.locator('[data-server-port]').fill(String(port));await page.locator('[data-server-save]').click();await page.locator('[data-player-server]').filter({hasText:'本机专用连接测试'}).waitFor();await page.waitForFunction(()=>!document.querySelector('[data-server-probe]')?.disabled);const snapshot=await rpc(app,'/player-servers'),favorite=snapshot.servers.find(s=>s.name==='本机专用连接测试');assert.ok(favorite);evidence.server=favorite;assert.equal(accepted,0);
+  await page.locator(`[data-server-probe="${favorite.id}"]`).click();await page.locator('.server-connection-result').filter({hasText:'端口可达'}).waitFor({timeout:10000});assert.ok(accepted>0);assert.ok((await page.locator('.server-connection-result').innerText()).includes('不代表'));await screenshot(app,'resources-servers-real-tcp');checks.push('native-save-server-and-manual-loopback-tcp-probe');
+  const article=page.locator(`[data-player-server="${favorite.id}"]`);await article.getByRole('button',{name:'编辑',exact:true}).click();await page.locator('[data-server-name]').fill('改名后的本机测试');await page.locator('[data-server-save]').click();await article.getByRole('heading',{name:'改名后的本机测试',exact:true}).waitFor();await article.getByText('尚未检测',{exact:true}).waitFor();checks.push('native-edit-server-clears-stale-probe');
+  if(instance.installation){
+   await page.locator('[data-server-instance]').selectOption(instance.id);await page.locator(`[data-server-connect="${favorite.id}"]`).click();await page.locator('[data-direct-target]').filter({hasText:'改名后的本机测试'}).waitFor();assert.ok((await page.locator('[data-direct-target]').innerText()).includes(String(port)));checks.push('native-direct-target-enters-existing-launch-check');
+   await page.locator('[data-launcher-page="accounts"]').click();await page.locator('[data-offline-name]').fill('SQY_Resource');await page.locator('.launcher-account-form button').click();await page.locator('[data-selected-identity]').filter({hasText:'当前选择 · SQY_Resource'}).waitFor();
+   const runtimes=await rpc(app,'/runtimes','POST',{home:path.join(app.root,'runtime')}),runtime=runtimes.runtimes.find(r=>r.majorVersion===21&&r.bits===64);assert.ok(runtime);const settings=await rpc(app,'/instances/'+instance.id+'/launch-settings');await rpc(app,'/instances/'+instance.id+'/launch-settings','POST',{revision:settings.revision,settings:{...settings.settings,javaId:runtime.id,initialMemoryMiB:256,maximumMemoryMiB:2048}});
+   await page.locator('[data-launcher-page="servers"]').click();await page.locator(`[data-server-connect="${favorite.id}"]`).waitFor();await page.locator('[data-server-instance]').selectOption(instance.id);await page.locator(`[data-server-connect="${favorite.id}"]`).click();await page.locator('[data-check-launch]').click();
+   let checkId;for(let i=0;i<100;i++){checkId=app.calls.findLast(c=>c.path==='/launch-checks'&&c.method==='POST')?.id;if(checkId)break;await sleep(100);}assert.ok(checkId);let check;for(let i=0;i<480;i++){check=(await rpc(app,'/launch-checks/'+checkId)).check;if(check.state!=='CHECKING')break;await sleep(500);}assert.equal(check.state,'READY',JSON.stringify(check));
+   const before=accepted;let launchId,exited=false;
+   try{
+    await page.locator('[data-start-launch]:not([disabled])').waitFor();await page.locator('[data-start-launch]').click();for(let i=0;i<100;i++){launchId=app.calls.findLast(c=>c.path==='/launches'&&c.method==='POST')?.id;if(launchId)break;await sleep(100);}assert.ok(launchId);let launch;for(let i=0;i<600;i++){launch=(await rpc(app,'/launches?instanceId='+instance.id)).launches.find(l=>l.id===launchId);if(launch.state==='RUNNING')break;assert.ok(!['FAILED','EXITED','CANCELLED'].includes(launch.state),JSON.stringify(launch));await sleep(500);}assert.equal(launch.state,'RUNNING');
+    for(let i=0;i<240&&accepted===before;i++)await sleep(500);assert.ok(accepted>before,'实际Minecraft应尝试连接这次选择的本机测试端口');assert.ok(packets.length,'实际游戏应发送协议数据，TCP探测不发送数据');
+    const record=JSON.parse(fs.readFileSync(path.join(app.root,'launcher-data/instances',instance.id,'launches',launchId,'launch.json'),'utf8')),actual=helper(['--pid',String(record.pid),'--action','inspect']);assert.equal(path.resolve(actual.executable).toLowerCase(),path.join(app.root,'runtime/bin/java.exe').toLowerCase());
+    const capture=helper(['--pid',String(record.pid),'--started-at',record.processStartedAt,'--action','capture','--output',path.join(out,'resource-direct-game.png')]);write('pending-resource-game.json',{launchId,record,capture,port,accepted,packets});console.log(JSON.stringify({status:'WAITING_DIRECT_GAME_CONFIRMATION',launchId,screenshot:path.join(out,'resource-direct-game.png')}));
+    const file=path.join(out,'resource-game-confirmation.json'),deadline=Date.now()+10*60000;while(!fs.existsSync(file)&&Date.now()<deadline)await sleep(500);const confirmed=JSON.parse(fs.readFileSync(file,'utf8'));assert.equal(confirmed.launchId,launchId);assert.equal(confirmed.connectionScreenConfirmed,true);assert.equal(digest(confirmed.screenshot),confirmed.sha256);
+    const closed=helper(['--pid',String(record.pid),'--started-at',record.processStartedAt,'--action','close']);assert.equal(closed.exitCode,0);for(let i=0;i<120;i++){launch=(await rpc(app,'/launches?instanceId='+instance.id)).launches.find(l=>l.id===launchId);if(launch.state==='EXITED')break;await sleep(500);}assert.equal(launch.exitCode,0);assert.equal(launch.state,'EXITED');exited=true;write('resource-direct-game-result.json',{launchId,record,port,accepted,packets,closed,confirmed});checks.push('native-bundled-java-real-minecraft-connects-selected-port-and-exits-zero');
+   }finally{if(launchId&&!exited)await rpc(app,'/launches/'+launchId+'/stop','POST',{confirmed:true}).catch(()=>{});}
+  }
+ }finally{for(const socket of sockets)socket.destroy();await new Promise(resolve=>server.close(resolve));}
+ assert.equal(digest(evidence.sentinel),evidence.sentinelHash);for(const [name,expected] of Object.entries(evidence.sourceHashes))assert.equal(digest(path.join(evidence.sources,name)),expected);
+ write('resources-evidence.json',evidence);write('resources-calls.json',app.calls);write('resources-sent.json',app.sent);
+}
+
+export async function checkNativeResourcesReopened({app,rpc,screenshot,checks,evidence}){
+ const snapshot=await rpc(app,'/player-servers');assert.ok(snapshot.servers.some(s=>s.id===evidence.server.id&&s.name==='改名后的本机测试'));for(const [,kind,file]of kinds)assert.ok((await rpc(app,'/resources?'+new URLSearchParams({instanceId:evidence.instanceId,kind}))).entries.some(e=>e.name===file));
+ await app.page.locator('[data-launcher-page="servers"]').click();await app.page.locator(`[data-player-server="${evidence.server.id}"]`).waitFor();await app.page.locator(`[data-server-remove="${evidence.server.id}"]`).click();assert.ok((await rpc(app,'/player-servers')).servers.length);await app.page.locator('[data-server-confirm-remove]').click();await app.page.locator(`[data-player-server="${evidence.server.id}"]`).waitFor({state:'detached'});assert.equal((await rpc(app,'/player-servers')).servers.length,0);checks.push('native-reopen-persistence-and-confirmed-server-remove');await screenshot(app,'resources-servers-reopened');
+}
